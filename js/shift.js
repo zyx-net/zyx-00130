@@ -21,6 +21,12 @@ const Shift = (function() {
       return { success: false, message: '请先登录' };
     }
 
+    const permission = Auth.requirePharmacist();
+    if (!permission.allowed) {
+      Storage.addAuditLog('越权拦截', `用户 ${user.name} (${user.roleName}) 尝试开班，已被拒绝`, user);
+      return { success: false, message: permission.message };
+    }
+
     if (hasActiveShift()) {
       return { success: false, message: '当前已有进行中的班次，请先完成交班' };
     }

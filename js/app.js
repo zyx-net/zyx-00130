@@ -270,6 +270,11 @@ const App = (function() {
   }
 
   function showOpenShiftModal() {
+    if (!Auth.isPharmacist()) {
+      alert('该操作需要药师权限');
+      return;
+    }
+
     const now = new Date();
     const defaultName = '早班-' + formatDateSimple(now);
 
@@ -296,6 +301,11 @@ const App = (function() {
   }
 
   function handleOpenShift() {
+    if (!Auth.isPharmacist()) {
+      alert('该操作需要药师权限');
+      return;
+    }
+
     const name = document.getElementById('shift-name-input').value.trim();
     const note = document.getElementById('shift-note-input').value.trim();
 
@@ -310,6 +320,11 @@ const App = (function() {
   }
 
   function handleCloseShift() {
+    if (!Auth.isPharmacist()) {
+      alert('该操作需要药师权限');
+      return;
+    }
+
     if (!confirm('确认完成交班？关班后将无法再修改盘点数据。')) {
       return;
     }
@@ -559,6 +574,11 @@ const App = (function() {
   }
 
   function resolveDiscrepancy(discrepancyId) {
+    if (!Auth.canResolveDiscrepancy()) {
+      alert('只有药师可以处理差异');
+      return;
+    }
+
     const resolution = prompt('请输入处理说明：');
     if (!resolution || resolution.trim() === '') {
       alert('请输入处理说明');
@@ -622,6 +642,11 @@ const App = (function() {
   }
 
   function reviewCorrection(discrepancyId, correctionId, approved) {
+    if (!Auth.canApproveCorrection()) {
+      alert('只有药师可以审批修正申请');
+      return;
+    }
+
     const note = approved ? '' : (prompt('请输入拒绝原因：') || '');
 
     const result = Discrepancy.reviewCorrection(discrepancyId, correctionId, approved, note);
