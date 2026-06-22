@@ -10,7 +10,9 @@ const Storage = (function() {
     DISCREPANCIES: PREFIX + 'discrepancies',
     AUDIT_LOGS: PREFIX + 'audit_logs',
     CURRENT_USER: PREFIX + 'current_user',
-    INITIALIZED: PREFIX + 'initialized'
+    INITIALIZED: PREFIX + 'initialized',
+    RESTORE_RECORDS: PREFIX + 'restore_records',
+    LAST_RESTORE_SNAPSHOT: PREFIX + 'last_restore_snapshot'
   };
 
   function get(key, defaultValue = null) {
@@ -498,6 +500,75 @@ const Storage = (function() {
     return true;
   }
 
+  function getRestoreRecords() {
+    return get(KEYS.RESTORE_RECORDS, []);
+  }
+
+  function addRestoreRecord(record) {
+    const records = getRestoreRecords();
+    const fullRecord = {
+      id: generateId('restore'),
+      timestamp: new Date().toISOString(),
+      timestampFormatted: formatDateTime(new Date()),
+      ...record
+    };
+    records.unshift(fullRecord);
+    set(KEYS.RESTORE_RECORDS, records);
+    return fullRecord;
+  }
+
+  function clearRestoreRecords() {
+    remove(KEYS.RESTORE_RECORDS);
+  }
+
+  function getLastRestoreSnapshot() {
+    return get(KEYS.LAST_RESTORE_SNAPSHOT, null);
+  }
+
+  function saveLastRestoreSnapshot(snapshot) {
+    return set(KEYS.LAST_RESTORE_SNAPSHOT, snapshot);
+  }
+
+  function clearLastRestoreSnapshot() {
+    remove(KEYS.LAST_RESTORE_SNAPSHOT);
+  }
+
+  function captureFullSnapshot() {
+    return {
+      drugs: deepCloneSafe(getDrugs()),
+      currentShift: deepCloneSafe(getCurrentShift()),
+      shiftHistory: deepCloneSafe(getShiftHistory()),
+      inventory: deepCloneSafe(get(KEYS.INVENTORY, {})),
+      discrepancies: deepCloneSafe(get(KEYS.DISCREPANCIES, {})),
+      auditLogs: deepCloneSafe(getAuditLogs())
+    };
+  }
+
+  function restoreFromSnapshot(snapshot) {
+    if (!snapshot) return false;
+    try {
+      if (snapshot.drugs !== undefined) saveDrugs(snapshot.drugs);
+      if (snapshot.currentShift !== undefined) saveCurrentShift(snapshot.currentShift);
+      if (snapshot.shiftHistory !== undefined) saveShiftHistory(snapshot.shiftHistory);
+      if (snapshot.inventory !== undefined) set(KEYS.INVENTORY, snapshot.inventory);
+      if (snapshot.discrepancies !== undefined) set(KEYS.DISCREPANCIES, snapshot.discrepancies);
+      if (snapshot.auditLogs !== undefined) set(KEYS.AUDIT_LOGS, snapshot.auditLogs);
+      return true;
+    } catch (e) {
+      console.error('Restore from snapshot failed:', e);
+      return false;
+    }
+  }
+
+  function deepCloneSafe(obj) {
+    if (obj === null || obj === undefined) return obj;
+    try {
+      return JSON.parse(JSON.stringify(obj));
+    } catch (e) {
+      return obj;
+    }
+  }
+
   function resetAllData() {
     Object.values(KEYS).forEach(key => remove(key));
   }
@@ -533,6 +604,14 @@ const Storage = (function() {
     setInitialized,
     initializeDemoData,
     loadSampleData,
+    getRestoreRecords,
+    addRestoreRecord,
+    clearRestoreRecords,
+    getLastRestoreSnapshot,
+    saveLastRestoreSnapshot,
+    clearLastRestoreSnapshot,
+    captureFullSnapshot,
+    restoreFromSnapshot,
     resetAllData
   };
 })();

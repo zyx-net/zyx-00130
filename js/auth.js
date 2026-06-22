@@ -72,6 +72,14 @@ const Auth = (function() {
     return isPharmacist();
   }
 
+  function canUndoRestore() {
+    return isPharmacist();
+  }
+
+  function canPerformRestore() {
+    return isPharmacist();
+  }
+
   return {
     login,
     logout,
@@ -83,6 +91,8 @@ const Auth = (function() {
     canEditInventory,
     canResolveDiscrepancy,
     canCloseShift,
-    canApproveCorrection
+    canApproveCorrection,
+    canUndoRestore,
+    canPerformRestore
   };
 })();

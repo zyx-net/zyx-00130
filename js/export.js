@@ -835,6 +835,324 @@ const ExportModule = (function() {
     }
   }
 
+  function preRestorePreview(backup, conflictResolutions) {
+    const validation = validateBackup(backup);
+    if (!validation.valid) {
+      return { success: false, message: validation.reason };
+    }
+
+    const resolutionsMap = {};
+    (conflictResolutions || []).forEach(r => {
+      const key = r.conflict.type + '|' + (
+        r.conflict.importedId ||
+        r.conflict.drugCode ||
+        (r.conflict.importedShiftId + '_' + r.conflict.correction.requestedAt)
+      );
+      resolutionsMap[key] = r.strategy;
+    });
+
+    const conflicts = detectConflicts(backup);
+
+    const skipShiftIds = new Set();
+    const overwriteShiftMap = {};
+    const mergeShiftMap = {};
+    conflicts.shifts.forEach(c => {
+      const key = c.type + '|' + c.importedId;
+      const strategy = resolutionsMap[key] || 'skip';
+      if (strategy === 'skip') {
+        skipShiftIds.add(c.importedId);
+      } else if (strategy === 'overwrite') {
+        overwriteShiftMap[c.importedId] = c.existingId;
+      } else if (strategy === 'merge') {
+        mergeShiftMap[c.importedId] = c.existingId;
+      }
+    });
+
+    const skipCorrectionKeys = new Set();
+    const overwriteCorrectionKeys = new Set();
+    const mergeCorrectionKeys = new Set();
+    conflicts.corrections.forEach(c => {
+      const key = c.type + '|' + c.importedShiftId + '_' + c.correction.requestedAt;
+      const strategy = resolutionsMap[key] || 'skip';
+      const dataKey = c.importedShiftId + '|' + c.correction.requestedAt;
+      if (strategy === 'skip') {
+        skipCorrectionKeys.add(dataKey);
+      } else if (strategy === 'overwrite') {
+        overwriteCorrectionKeys.add(dataKey);
+      } else if (strategy === 'merge') {
+        mergeCorrectionKeys.add(dataKey);
+      }
+    });
+
+    const skipDrugCodes = new Set();
+    const overwriteDrugCodes = new Set();
+    const mergeDrugCodes = new Set();
+    conflicts.drugs.forEach(c => {
+      const key = c.type + '|' + c.drugCode;
+      const strategy = resolutionsMap[key] || 'skip';
+      if (strategy === 'skip') {
+        skipDrugCodes.add(c.drugCode);
+      } else if (strategy === 'overwrite') {
+        overwriteDrugCodes.add(c.drugCode);
+      } else if (strategy === 'merge') {
+        mergeDrugCodes.add(c.drugCode);
+      }
+    });
+
+    const preview = {
+      shifts: { new: [], overwrite: [], merge: [], skip: [] },
+      inventories: { affectedShiftIds: [] },
+      discrepancies: { affectedShiftIds: [] },
+      corrections: { overwrite: 0, merge: 0, skip: 0 },
+      drugs: { new: [], overwrite: [], merge: [], skip: [] },
+      auditLogs: { willImport: 0 }
+    };
+
+    const existingHistory = Storage.getShiftHistory();
+    const existingShiftIds = new Set(existingHistory.map(s => s.id));
+    const existingCurrentShift = Storage.getCurrentShift();
+    if (existingCurrentShift) existingShiftIds.add(existingCurrentShift.id);
+
+    const importedHistoryShifts = backup.data.shiftHistory || [];
+    importedHistoryShifts.forEach(shift => {
+      if (skipShiftIds.has(shift.id)) {
+        preview.shifts.skip.push({ id: shift.id, name: shift.name, reason: '冲突策略-跳过' });
+      } else if (overwriteShiftMap[shift.id]) {
+        preview.shifts.overwrite.push({
+          id: shift.id, name: shift.name,
+          existingId: overwriteShiftMap[shift.id],
+          existingName: conflicts.shifts.find(c => c.importedId === shift.id)?.existing?.name || shift.name
+        });
+      } else if (mergeShiftMap[shift.id]) {
+        preview.shifts.merge.push({
+          id: shift.id, name: shift.name,
+          mergedIntoId: mergeShiftMap[shift.id]
+        });
+      } else if (!existingShiftIds.has(shift.id)) {
+        preview.shifts.new.push({ id: shift.id, name: shift.name });
+      }
+    });
+
+    if (backup.data.currentShift && !skipShiftIds.has(backup.data.currentShift.id)) {
+      const curr = backup.data.currentShift;
+      if (overwriteShiftMap[curr.id]) {
+        preview.shifts.overwrite.push({
+          id: curr.id, name: curr.name,
+          existingId: overwriteShiftMap[curr.id],
+          existingName: conflicts.shifts.find(c => c.importedId === curr.id)?.existing?.name || curr.name,
+          isCurrent: true
+        });
+      } else if (mergeShiftMap[curr.id]) {
+        preview.shifts.merge.push({
+          id: curr.id, name: curr.name,
+          mergedIntoId: mergeShiftMap[curr.id],
+          isCurrent: true
+        });
+      } else if (!existingCurrentShift || existingCurrentShift.id !== curr.id) {
+        preview.shifts.new.push({ id: curr.id, name: curr.name, isCurrent: true });
+      }
+    } else if (backup.data.currentShift) {
+      preview.shifts.skip.push({
+        id: backup.data.currentShift.id,
+        name: backup.data.currentShift.name,
+        reason: '冲突策略-跳过'
+      });
+    }
+
+    const inventoryMap = backup.data.inventory || {};
+    Object.keys(inventoryMap).forEach(shiftId => {
+      if (!skipShiftIds.has(shiftId)) {
+        preview.inventories.affectedShiftIds.push(shiftId);
+      }
+    });
+
+    const discrepanciesMap = backup.data.discrepancies || {};
+    Object.keys(discrepanciesMap).forEach(shiftId => {
+      if (!skipShiftIds.has(shiftId)) {
+        preview.discrepancies.affectedShiftIds.push(shiftId);
+      }
+    });
+
+    Object.values(discrepanciesMap).forEach(discList => {
+      discList.forEach(d => {
+        if (d.corrections) {
+          d.corrections.forEach(c => {
+            Object.entries(conflicts.corrections.length > 0 ? {} : {});
+            const corrConflict = conflicts.corrections.find(cc =>
+              cc.correction.requestedAt === c.requestedAt &&
+              cc.correction.requestedBy === c.requestedBy
+            );
+            if (corrConflict) {
+              const dataKey = corrConflict.importedShiftId + '|' + c.requestedAt;
+              if (overwriteCorrectionKeys.has(dataKey)) preview.corrections.overwrite++;
+              else if (mergeCorrectionKeys.has(dataKey)) preview.corrections.merge++;
+              else preview.corrections.skip++;
+            }
+          });
+        }
+      });
+    });
+
+    const existingDrugs = Storage.getDrugs();
+    const existingDrugMap = {};
+    existingDrugs.forEach(d => { existingDrugMap[d.code] = d; });
+    (backup.data.drugs || []).forEach(drug => {
+      if (skipDrugCodes.has(drug.code)) {
+        preview.drugs.skip.push({ code: drug.code, name: drug.name, reason: '冲突策略-跳过(保留本地)' });
+      } else if (overwriteDrugCodes.has(drug.code)) {
+        preview.drugs.overwrite.push({
+          code: drug.code,
+          name: drug.code,
+          imported: { name: drug.name, initialStock: drug.initialStock },
+          existing: existingDrugMap[drug.code] ? { name: existingDrugMap[drug.code].name, initialStock: existingDrugMap[drug.code].initialStock } : null
+        });
+      } else if (mergeDrugCodes.has(drug.code)) {
+        preview.drugs.merge.push({ code: drug.code, name: drug.name });
+      } else if (!existingDrugMap[drug.code]) {
+        preview.drugs.new.push({ code: drug.code, name: drug.name });
+      }
+    });
+
+    const existingLogs = Storage.getAuditLogs();
+    const existingLogIds = new Set(existingLogs.map(l => l.id));
+    const newLogs = (backup.data.auditLogs || []).filter(l => l.id && !existingLogIds.has(l.id));
+    preview.auditLogs.willImport = newLogs.length;
+
+    const summary = {
+      totalShifts: preview.shifts.new.length + preview.shifts.overwrite.length + preview.shifts.merge.length,
+      newShifts: preview.shifts.new.length,
+      overwrittenShifts: preview.shifts.overwrite.length,
+      mergedShifts: preview.shifts.merge.length,
+      skippedShifts: preview.shifts.skip.length,
+      affectedInventories: preview.inventories.affectedShiftIds.length,
+      affectedDiscrepancies: preview.discrepancies.affectedShiftIds.length,
+      overwrittenCorrections: preview.corrections.overwrite,
+      mergedCorrections: preview.corrections.merge,
+      skippedCorrections: preview.corrections.skip,
+      newDrugs: preview.drugs.new.length,
+      overwrittenDrugs: preview.drugs.overwrite.length,
+      mergedDrugs: preview.drugs.merge.length,
+      skippedDrugs: preview.drugs.skip.length,
+      importAuditLogs: preview.auditLogs.willImport,
+      conflicts: conflicts
+    };
+
+    return {
+      success: true,
+      preview: preview,
+      summary: summary,
+      summaryText: `预演：新增班次${summary.newShifts}个，覆盖${summary.overwrittenShifts}个，合并${summary.mergedShifts}个，跳过${summary.skippedShifts}个；影响${summary.affectedInventories}个班次盘点、${summary.affectedDiscrepancies}个班次差异；新增药品${summary.newDrugs}种，覆盖${summary.overwrittenDrugs}种，合并${summary.mergedDrugs}种；将导入${summary.importAuditLogs}条审计日志`
+    };
+  }
+
+  function getRestoreRecords() {
+    return Storage.getRestoreRecords();
+  }
+
+  function undoLastRestore() {
+    const user = Auth.getCurrentUser();
+    if (!user) {
+      return { success: false, message: '请先登录后再撤回恢复' };
+    }
+    if (!Auth.canUndoRestore()) {
+      return { success: false, message: '只有药师可以撤回恢复操作' };
+    }
+
+    const snapshot = Storage.getLastRestoreSnapshot();
+    if (!snapshot) {
+      return { success: false, message: '没有可撤回的恢复操作（未找到恢复前快照）' };
+    }
+
+    const records = Storage.getRestoreRecords();
+    const lastRecord = records.length > 0 ? records[0] : null;
+    if (lastRecord && lastRecord.undone) {
+      return { success: false, message: '最近一次恢复已被撤回，无法重复撤回' };
+    }
+
+    const restored = Storage.restoreFromSnapshot(snapshot);
+    if (!restored) {
+      return { success: false, message: '撤回失败：快照恢复出错' };
+    }
+
+    if (lastRecord) {
+      const updatedRecords = records.slice();
+      updatedRecords[0] = { ...lastRecord, undone: true, undoneAt: new Date().toISOString(), undoneAtFormatted: Storage.formatDateTime(new Date()), undoneBy: { id: user.id, name: user.name, role: user.role } };
+      Storage.set(Storage.KEYS.RESTORE_RECORDS, updatedRecords);
+    }
+
+    Storage.clearLastRestoreSnapshot();
+
+    Storage.addAuditLog(
+      '撤回数据恢复',
+      lastRecord
+        ? `撤回了 ${lastRecord.restoredAtFormatted || lastRecord.timestampFormatted} 的恢复操作，由 ${user.name} 执行`
+        : `撤回了最近一次数据恢复操作，由 ${user.name} 执行`,
+      user
+    );
+
+    return {
+      success: true,
+      message: '恢复操作已成功撤回，数据已还原到恢复前状态',
+      record: lastRecord
+    };
+  }
+
+  const originalApplyBackup = applyBackup;
+  function applyBackupWithTracking(backup, conflictResolutions) {
+    const user = Auth.getCurrentUser();
+    if (!user) {
+      return { success: false, message: '请先登录后再导入数据' };
+    }
+    if (!Auth.canPerformRestore()) {
+      return { success: false, message: '只有药师可以执行数据恢复操作' };
+    }
+
+    const validation = validateBackup(backup);
+    if (!validation.valid) {
+      return { success: false, message: validation.reason };
+    }
+
+    const snapshot = Storage.captureFullSnapshot();
+    Storage.saveLastRestoreSnapshot(snapshot);
+
+    const preview = preRestorePreview(backup, conflictResolutions || []);
+
+    const result = originalApplyBackup(backup, conflictResolutions || []);
+
+    if (result.success) {
+      const record = Storage.addRestoreRecord({
+        backupVersion: backup.version,
+        backupExportedAt: backup.exportedAt,
+        backupExportedAtFormatted: backup.exportedAtFormatted,
+        backupExportedBy: backup.exportedBy || null,
+        restoredBy: { id: user.id, name: user.name, role: user.role },
+        conflictResolutions: (conflictResolutions || []).map(r => ({
+          type: r.conflict.type,
+          target: r.conflict.importedName || r.conflict.drugCode || (r.conflict.importedShiftId + '_' + r.conflict.correction.requestedAt),
+          strategy: r.strategy,
+          description: r.description
+        })),
+        previewSummary: preview.success ? preview.summary : null,
+        results: result.results,
+        undone: false
+      });
+
+      result.restoreRecordId = record.id;
+      result.restoreRecord = record;
+
+      const logs = Storage.getAuditLogs();
+      const restoreLog = logs.find(l => l.action === '导入数据备份');
+      if (restoreLog) {
+        restoreLog.details += `；恢复记录ID: ${record.id}`;
+        Storage.set(Storage.KEYS.AUDIT_LOGS, logs);
+      }
+    } else {
+      Storage.clearLastRestoreSnapshot();
+    }
+
+    return result;
+  }
+
   return {
     generateShiftReport,
     downloadReport,
@@ -845,9 +1163,12 @@ const ExportModule = (function() {
     detectConflicts,
     resolveConflictStrategy,
     describeConflictResolution,
-    applyBackup,
+    applyBackup: applyBackupWithTracking,
     parseBackupFile,
     sanitizeUsersForImport,
-    sanitizeAuditLogsForImport
+    sanitizeAuditLogsForImport,
+    preRestorePreview,
+    undoLastRestore,
+    getRestoreRecords
   };
 })();
