@@ -238,6 +238,10 @@ const ExportModule = (function() {
 
   const BACKUP_VERSION = '1.0.0';
 
+  function deepCloneObj(obj) {
+    return JSON.parse(JSON.stringify(obj));
+  }
+
   function createBackup() {
     const user = Auth.getCurrentUser();
 
@@ -513,39 +517,64 @@ const ExportModule = (function() {
 
     const conflicts = detectConflicts(backup);
 
-    let skipShiftIds = new Set();
+    const skipShiftIds = new Set();
+    const overwriteShiftMap = {};
+    const mergeShiftMap = {};
     conflicts.shifts.forEach(c => {
       const key = c.type + '|' + c.importedId;
       const strategy = resolutionsMap[key] || 'skip';
       if (strategy === 'skip') {
         skipShiftIds.add(c.importedId);
+      } else if (strategy === 'overwrite') {
+        overwriteShiftMap[c.importedId] = c.existingId;
+      } else if (strategy === 'merge') {
+        mergeShiftMap[c.importedId] = c.existingId;
       }
     });
 
     const skipCorrectionKeys = new Set();
+    const overwriteCorrectionKeys = new Set();
+    const mergeCorrectionKeys = new Set();
     conflicts.corrections.forEach(c => {
       const key = c.type + '|' + c.importedShiftId + '_' + c.correction.requestedAt;
       const strategy = resolutionsMap[key] || 'skip';
+      const dataKey = c.importedShiftId + '|' + c.correction.requestedAt;
       if (strategy === 'skip') {
-        skipCorrectionKeys.add(c.importedShiftId + '|' + c.correction.requestedAt);
+        skipCorrectionKeys.add(dataKey);
+      } else if (strategy === 'overwrite') {
+        overwriteCorrectionKeys.add(dataKey);
+      } else if (strategy === 'merge') {
+        mergeCorrectionKeys.add(dataKey);
       }
     });
 
     const skipDrugCodes = new Set();
+    const overwriteDrugCodes = new Set();
+    const mergeDrugCodes = new Set();
     conflicts.drugs.forEach(c => {
       const key = c.type + '|' + c.drugCode;
       const strategy = resolutionsMap[key] || 'skip';
-      if (strategy === 'skip' || strategy === 'merge') {
+      if (strategy === 'skip') {
         skipDrugCodes.add(c.drugCode);
+      } else if (strategy === 'overwrite') {
+        overwriteDrugCodes.add(c.drugCode);
+      } else if (strategy === 'merge') {
+        mergeDrugCodes.add(c.drugCode);
       }
     });
 
     const results = {
       importedShifts: 0,
+      overwrittenShifts: 0,
+      mergedShifts: 0,
       skippedShifts: 0,
       importedInventories: 0,
       importedDiscrepancies: 0,
+      overwrittenCorrections: 0,
+      mergedCorrections: 0,
       importedDrugs: 0,
+      overwrittenDrugs: 0,
+      mergedDrugs: 0,
       importedAuditLogs: 0,
       messages: []
     };
@@ -564,7 +593,33 @@ const ExportModule = (function() {
         results.messages.push(`跳过历史班次：${shift.name}`);
         return;
       }
-      if (!existingShiftIds.has(shift.id)) {
+      if (overwriteShiftMap[shift.id]) {
+        const existId = overwriteShiftMap[shift.id];
+        const idx = existingHistory.findIndex(s => s.id === existId);
+        if (idx >= 0) {
+          existingHistory[idx] = shift;
+        } else {
+          existingHistory.push(shift);
+        }
+        results.overwrittenShifts++;
+        results.messages.push(`覆盖历史班次：${shift.name}（替换本地班次ID ${existId}）`);
+      } else if (mergeShiftMap[shift.id]) {
+        const existId = mergeShiftMap[shift.id];
+        const existIdx = existingHistory.findIndex(s => s.id === existId);
+        if (existIdx >= 0) {
+          const existShift = existingHistory[existIdx];
+          if (shift.summary) existShift.summary = shift.summary;
+          if (shift.closedAt) existShift.closedAt = shift.closedAt;
+          if (shift.closedAtFormatted) existShift.closedAtFormatted = shift.closedAtFormatted;
+          if (shift.closedBy) existShift.closedBy = shift.closedBy;
+          if (shift.closedByName) existShift.closedByName = shift.closedByName;
+          if (shift.receivedBy) existShift.receivedBy = shift.receivedBy;
+          if (shift.receivedByName) existShift.receivedByName = shift.receivedByName;
+          existingHistory[existIdx] = existShift;
+        }
+        results.mergedShifts++;
+        results.messages.push(`合并历史班次：${shift.name}（合入本地班次ID ${existId}）`);
+      } else if (!existingShiftIds.has(shift.id)) {
         existingHistory.push(shift);
         results.importedShifts++;
         results.messages.push(`导入历史班次：${shift.name}`);
@@ -575,7 +630,22 @@ const ExportModule = (function() {
     if (backup.data.currentShift && !skipShiftIds.has(backup.data.currentShift.id)) {
       const curr = backup.data.currentShift;
       const existingCurr = Storage.getCurrentShift();
-      if (!existingCurr || existingCurr.id === curr.id || !existingShiftIds.has(curr.id)) {
+      const isOverwrite = overwriteShiftMap[curr.id];
+      const isMerge = mergeShiftMap[curr.id];
+      if (isOverwrite) {
+        Storage.saveCurrentShift(curr);
+        results.overwrittenShifts++;
+        results.messages.push(`覆盖当前班次：${curr.name}`);
+      } else if (isMerge && existingCurr) {
+        if (curr.summary) existingCurr.summary = curr.summary;
+        if (curr.closedAt) existingCurr.closedAt = curr.closedAt;
+        if (curr.closedAtFormatted) existingCurr.closedAtFormatted = curr.closedAtFormatted;
+        if (curr.closedBy) existingCurr.closedBy = curr.closedBy;
+        if (curr.closedByName) existingCurr.closedByName = curr.closedByName;
+        Storage.saveCurrentShift(existingCurr);
+        results.mergedShifts++;
+        results.messages.push(`合并当前班次：${curr.name}`);
+      } else if (!existingCurr || existingCurr.id === curr.id || !existingShiftIds.has(curr.id)) {
         if (!existingCurr || existingCurr.status === Shift.STATUS.CLOSED) {
           Storage.saveCurrentShift(curr);
           results.importedShifts++;
@@ -593,9 +663,29 @@ const ExportModule = (function() {
     const inventoryMap = backup.data.inventory || {};
     Object.entries(inventoryMap).forEach(([shiftId, items]) => {
       if (skipShiftIds.has(shiftId)) return;
-      const existing = Storage.getInventory(shiftId);
-      if (existing.length === 0) {
-        Storage.saveInventory(shiftId, items);
+
+      let targetShiftId = shiftId;
+      if (overwriteShiftMap[shiftId]) {
+        targetShiftId = overwriteShiftMap[shiftId];
+      } else if (mergeShiftMap[shiftId]) {
+        targetShiftId = mergeShiftMap[shiftId];
+      }
+
+      const existing = Storage.getInventory(targetShiftId);
+      if (existing.length === 0 || overwriteShiftMap[shiftId]) {
+        Storage.saveInventory(targetShiftId, items);
+        if (targetShiftId !== shiftId) {
+          Storage.saveInventory(shiftId, items);
+        }
+        results.importedInventories++;
+      } else if (mergeShiftMap[shiftId]) {
+        const existingByCode = {};
+        existing.forEach(i => { existingByCode[i.drugCode] = i; });
+        items.forEach(i => {
+          existingByCode[i.drugCode] = i;
+        });
+        const merged = Object.values(existingByCode);
+        Storage.saveInventory(targetShiftId, merged);
         results.importedInventories++;
       }
     });
@@ -604,7 +694,14 @@ const ExportModule = (function() {
     Object.entries(discrepanciesMap).forEach(([shiftId, discList]) => {
       if (skipShiftIds.has(shiftId)) return;
 
-      const filteredDiscList = discList.map(d => {
+      let targetShiftId = shiftId;
+      if (overwriteShiftMap[shiftId]) {
+        targetShiftId = overwriteShiftMap[shiftId];
+      } else if (mergeShiftMap[shiftId]) {
+        targetShiftId = mergeShiftMap[shiftId];
+      }
+
+      const processedDiscList = discList.map(d => {
         if (d.corrections) {
           d.corrections = d.corrections.filter(c => {
             const key = shiftId + '|' + c.requestedAt;
@@ -614,33 +711,89 @@ const ExportModule = (function() {
         return d;
       });
 
-      const existing = Storage.getDiscrepancies(shiftId);
+      const existing = Storage.getDiscrepancies(targetShiftId);
       if (existing.length === 0) {
-        Storage.saveDiscrepancies(shiftId, filteredDiscList);
+        Storage.saveDiscrepancies(targetShiftId, processedDiscList);
+        if (targetShiftId !== shiftId) {
+          Storage.saveDiscrepancies(shiftId, processedDiscList);
+        }
         results.importedDiscrepancies++;
       } else {
-        const existingDrugIds = new Set(existing.map(d => d.drugId));
-        filteredDiscList.forEach(d => {
-          if (!existingDrugIds.has(d.drugId)) {
-            existing.push(d);
+        const isShiftOverwrite = !!overwriteShiftMap[shiftId];
+        const baseByDrugId = {};
+        if (isShiftOverwrite) {
+          processedDiscList.forEach(d => { baseByDrugId[d.drugId] = deepCloneObj(d); });
+        } else {
+          existing.forEach(d => { baseByDrugId[d.drugId] = deepCloneObj(d); });
+        }
+
+        const secondaryList = isShiftOverwrite ? existing : processedDiscList;
+        secondaryList.forEach(secDisc => {
+          const baseDisc = baseByDrugId[secDisc.drugId];
+          if (!baseDisc) {
+            if (!isShiftOverwrite) {
+              baseByDrugId[secDisc.drugId] = secDisc;
+            }
+          } else if (secDisc.corrections && secDisc.corrections.length > 0) {
+            const baseCorrByTime = {};
+            if (baseDisc.corrections) {
+              baseDisc.corrections.forEach(c => {
+                baseCorrByTime[c.requestedAt] = c;
+              });
+            }
+
+            secDisc.corrections.forEach(secCorr => {
+              const corrKey = shiftId + '|' + secCorr.requestedAt;
+              if (overwriteCorrectionKeys.has(corrKey)) {
+                baseCorrByTime[secCorr.requestedAt] = secCorr;
+                results.overwrittenCorrections++;
+              } else if (mergeCorrectionKeys.has(corrKey)) {
+                if (!baseCorrByTime[secCorr.requestedAt]) {
+                  baseCorrByTime[secCorr.requestedAt] = secCorr;
+                }
+                results.mergedCorrections++;
+              } else {
+                if (!baseCorrByTime[secCorr.requestedAt]) {
+                  baseCorrByTime[secCorr.requestedAt] = secCorr;
+                }
+              }
+            });
+
+            baseDisc.corrections = Object.values(baseCorrByTime);
+            baseByDrugId[secDisc.drugId] = baseDisc;
           }
         });
-        Storage.saveDiscrepancies(shiftId, existing);
+
+        Storage.saveDiscrepancies(targetShiftId, Object.values(baseByDrugId));
+        if (targetShiftId !== shiftId) {
+          Storage.saveDiscrepancies(shiftId, Object.values(baseByDrugId));
+        }
         results.importedDiscrepancies++;
       }
     });
 
     const existingDrugs = Storage.getDrugs();
     const importedDrugs = backup.data.drugs || [];
-    const existingDrugCodes = new Set(existingDrugs.map(d => d.code));
+    const existingDrugMap = {};
+    existingDrugs.forEach(d => { existingDrugMap[d.code] = d; });
+
     importedDrugs.forEach(drug => {
-      if (skipDrugCodes.has(drug.code)) return;
-      if (!existingDrugCodes.has(drug.code)) {
-        existingDrugs.push(drug);
+      if (skipDrugCodes.has(drug.code)) {
+        return;
+      }
+      if (overwriteDrugCodes.has(drug.code)) {
+        existingDrugMap[drug.code] = drug;
+        results.overwrittenDrugs++;
+        results.messages.push(`覆盖药品：${drug.code} ${drug.name}`);
+      } else if (mergeDrugCodes.has(drug.code)) {
+        results.mergedDrugs++;
+        results.messages.push(`合并药品：${drug.code}（保留本地）`);
+      } else if (!existingDrugMap[drug.code]) {
+        existingDrugMap[drug.code] = drug;
         results.importedDrugs++;
       }
     });
-    Storage.saveDrugs(existingDrugs);
+    Storage.saveDrugs(Object.values(existingDrugMap));
 
     const existingLogs = Storage.getAuditLogs();
     const sanitizedLogs = sanitizeAuditLogsForImport(backup.data.auditLogs || [], existingLogs);
@@ -651,14 +804,14 @@ const ExportModule = (function() {
 
     Storage.addAuditLog(
       '导入数据备份',
-      `数据恢复完成：导入班次${results.importedShifts}个，跳过${results.skippedShifts}个；导入盘点${results.importedInventories}组；导入差异${results.importedDiscrepancies}组；导入药品${results.importedDrugs}种；导入审计日志${results.importedAuditLogs}条`,
+      `数据恢复完成：导入班次${results.importedShifts}个，覆盖${results.overwrittenShifts}个，合并${results.mergedShifts}个，跳过${results.skippedShifts}个；覆盖修正${results.overwrittenCorrections}条，合并修正${results.mergedCorrections}条；覆盖药品${results.overwrittenDrugs}种，合并药品${results.mergedDrugs}种；导入审计日志${results.importedAuditLogs}条`,
       user
     );
 
     return {
       success: true,
       results: results,
-      summary: `恢复完成：${results.importedShifts}个班次，${results.importedAuditLogs}条审计日志已导入`
+      summary: `恢复完成：导入${results.importedShifts}个班次，覆盖${results.overwrittenShifts}个，合并${results.mergedShifts}个；覆盖修正${results.overwrittenCorrections}条，合并修正${results.mergedCorrections}条；导入审计日志${results.importedAuditLogs}条`
     };
   }
 
