@@ -236,9 +236,465 @@ const ExportModule = (function() {
     return report;
   }
 
+  const BACKUP_VERSION = '1.0.0';
+
+  function createBackup() {
+    const user = Auth.getCurrentUser();
+
+    const currentShift = Storage.getCurrentShift();
+    const shiftHistory = Storage.getShiftHistory();
+
+    const allShiftIds = [];
+    if (currentShift) allShiftIds.push(currentShift.id);
+    shiftHistory.forEach(s => allShiftIds.push(s.id));
+
+    const inventoryMap = {};
+    const discrepanciesMap = {};
+    allShiftIds.forEach(shiftId => {
+      inventoryMap[shiftId] = Storage.getInventory(shiftId);
+      discrepanciesMap[shiftId] = Storage.getDiscrepancies(shiftId);
+    });
+
+    const auditLogs = Storage.getAuditLogs();
+    const drugs = Storage.getDrugs();
+
+    const backup = {
+      version: BACKUP_VERSION,
+      exportedAt: new Date().toISOString(),
+      exportedAtFormatted: Storage.formatDateTime(new Date()),
+      exportedBy: user ? { id: user.id, name: user.name, role: user.role } : null,
+      data: {
+        currentShift: currentShift,
+        shiftHistory: shiftHistory,
+        inventory: inventoryMap,
+        discrepancies: discrepanciesMap,
+        auditLogs: auditLogs,
+        drugs: drugs
+      }
+    };
+
+    return backup;
+  }
+
+  function downloadBackup() {
+    const backup = createBackup();
+    const content = JSON.stringify(backup, null, 2);
+    const filename = '药房交班数据备份_' + formatDateForFilename(new Date()) + '.json';
+
+    const blob = new Blob([content], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    const user = Auth.getCurrentUser();
+    Storage.addAuditLog('导出数据备份', '导出完整结构化数据备份', user);
+
+    return { success: true, filename: filename };
+  }
+
+  function validateBackup(backup) {
+    if (!backup || typeof backup !== 'object') {
+      return { valid: false, reason: '备份文件格式无效' };
+    }
+    if (!backup.version) {
+      return { valid: false, reason: '备份文件缺少版本信息' };
+    }
+    if (!backup.data || typeof backup.data !== 'object') {
+      return { valid: false, reason: '备份文件缺少数据部分' };
+    }
+    const requiredKeys = ['currentShift', 'shiftHistory', 'inventory', 'discrepancies', 'auditLogs', 'drugs'];
+    for (const key of requiredKeys) {
+      if (!(key in backup.data)) {
+        return { valid: false, reason: `备份文件缺少必要数据: ${key}` };
+      }
+    }
+    return { valid: true };
+  }
+
+  function sanitizeAuditLogsForImport(importedLogs, existingLogs) {
+    const existingIds = new Set(existingLogs.map(l => l.id));
+    const sanitized = [];
+
+    for (const log of importedLogs) {
+      if (!log.id) continue;
+      if (existingIds.has(log.id)) continue;
+
+      if (!log.timestampFormatted && log.timestamp) {
+        log.timestampFormatted = Storage.formatDateTime(new Date(log.timestamp));
+      }
+
+      sanitized.push(log);
+    }
+
+    return sanitized;
+  }
+
+  function sanitizeUsersForImport(backupData) {
+    const discrepancies = backupData.discrepancies || {};
+    Object.values(discrepancies).forEach(discList => {
+      discList.forEach(d => {
+        if (d.corrections) {
+          d.corrections.forEach(c => {
+            if (c.status === 'approved' || c.status === 'rejected') {
+              if (c.reviewedBy && c.reviewedByName) {
+                const isNurseApprover = c.reviewedByName && c.reviewedByName.includes('护士');
+                if (isNurseApprover && c.status === 'approved') {
+                  c.status = 'pending';
+                  c.reviewedBy = null;
+                  c.reviewedByName = null;
+                  c.reviewedAt = null;
+                  c.reviewedAtFormatted = null;
+                  c.reviewNote = (c.reviewNote ? c.reviewNote + '；' : '') + '【系统保护】原审批人角色异常，已重置为待审批状态';
+                }
+              }
+            }
+          });
+        }
+      });
+    });
+
+    return discrepancies;
+  }
+
+  function detectConflicts(backup) {
+    const conflicts = {
+      shifts: [],
+      corrections: [],
+      drugs: []
+    };
+
+    const existingCurrentShift = Storage.getCurrentShift();
+    const existingHistory = Storage.getShiftHistory();
+    const existingShifts = existingHistory.slice();
+    if (existingCurrentShift) existingShifts.push(existingCurrentShift);
+
+    const importedShifts = [];
+    if (backup.data.currentShift) importedShifts.push(backup.data.currentShift);
+    backup.data.shiftHistory.forEach(s => importedShifts.push(s));
+
+    importedShifts.forEach(impShift => {
+      const existing = existingShifts.find(es => es.name === impShift.name);
+      if (existing) {
+        conflicts.shifts.push({
+          type: 'shift_name_conflict',
+          importedId: impShift.id,
+          importedName: impShift.name,
+          existingId: existing.id,
+          existingName: existing.name,
+          imported: impShift,
+          existing: existing
+        });
+      }
+    });
+
+    const existingAllDisc = {};
+    existingShifts.forEach(s => {
+      existingAllDisc[s.id] = Storage.getDiscrepancies(s.id);
+    });
+
+    const importedDisc = backup.data.discrepancies || {};
+    Object.entries(importedDisc).forEach(([shiftId, discList]) => {
+      discList.forEach(d => {
+        if (d.corrections && d.corrections.length > 0) {
+          d.corrections.forEach(corr => {
+            Object.entries(existingAllDisc).forEach(([existShiftId, existDiscList]) => {
+              existDiscList.forEach(ed => {
+                if (ed.corrections) {
+                  ed.corrections.forEach(ec => {
+                    const isSame = (
+                      corr.requestedBy === ec.requestedBy &&
+                      corr.requestedAt === ec.requestedAt &&
+                      corr.newActualQuantity === ec.newActualQuantity
+                    );
+                    if (isSame) {
+                      conflicts.corrections.push({
+                        type: 'duplicate_correction',
+                        importedShiftId: shiftId,
+                        existingShiftId: existShiftId,
+                        importedDiscrepancyDrug: d.drugName,
+                        existingDiscrepancyDrug: ed.drugName,
+                        correction: corr,
+                        existingCorrection: ec
+                      });
+                    }
+                  });
+                }
+              });
+            });
+          });
+        }
+      });
+    });
+
+    const existingDrugs = Storage.getDrugs();
+    const importedDrugs = backup.data.drugs || [];
+
+    importedDrugs.forEach(impDrug => {
+      const existing = existingDrugs.find(ed => ed.code === impDrug.code);
+      if (existing) {
+        const isContentDifferent = (
+          existing.name !== impDrug.name ||
+          existing.spec !== impDrug.spec ||
+          existing.type !== impDrug.type ||
+          existing.unit !== impDrug.unit ||
+          existing.initialStock !== impDrug.initialStock
+        );
+        if (isContentDifferent) {
+          conflicts.drugs.push({
+            type: 'drug_content_conflict',
+            drugCode: impDrug.code,
+            imported: impDrug,
+            existing: existing
+          });
+        }
+      }
+    });
+
+    return conflicts;
+  }
+
+  function resolveConflictStrategy(conflict, strategy) {
+    return {
+      conflict: conflict,
+      strategy: strategy,
+      description: describeConflictResolution(conflict, strategy)
+    };
+  }
+
+  function describeConflictResolution(conflict, strategy) {
+    switch (conflict.type) {
+      case 'shift_name_conflict':
+        if (strategy === 'skip') return `班次「${conflict.importedName}」已存在，跳过导入`;
+        if (strategy === 'overwrite') return `班次「${conflict.importedName}」将覆盖现有班次数据`;
+        if (strategy === 'merge') return `班次「${conflict.importedName}」将合并差异数据`;
+        break;
+      case 'duplicate_correction':
+        if (strategy === 'skip') return `药品「${conflict.importedDiscrepancyDrug}」的修正申请重复，跳过导入`;
+        if (strategy === 'overwrite') return `药品「${conflict.importedDiscrepancyDrug}」的修正申请将覆盖现有记录`;
+        if (strategy === 'merge') return `药品「${conflict.importedDiscrepancyDrug}」的修正申请将保留两条记录`;
+        break;
+      case 'drug_content_conflict':
+        if (strategy === 'skip') return `药品「${conflict.drugCode}」内容不一致，跳过导入（保留本地）`;
+        if (strategy === 'overwrite') return `药品「${conflict.drugCode}」将被备份数据覆盖`;
+        if (strategy === 'merge') return `药品「${conflict.drugCode}」将保留本地内容，不修改`;
+        break;
+    }
+    return `冲突已选择策略：${strategy}`;
+  }
+
+  function applyBackup(backup, conflictResolutions) {
+    const user = Auth.getCurrentUser();
+    if (!user) {
+      return { success: false, message: '请先登录后再导入数据' };
+    }
+    if (user.role !== 'pharmacist') {
+      return { success: false, message: '只有药师可以执行数据恢复操作' };
+    }
+
+    const validation = validateBackup(backup);
+    if (!validation.valid) {
+      return { success: false, message: validation.reason };
+    }
+
+    const resolutionsMap = {};
+    (conflictResolutions || []).forEach(r => {
+      const key = r.conflict.type + '|' + (
+        r.conflict.importedId ||
+        r.conflict.drugCode ||
+        (r.conflict.importedShiftId + '_' + r.conflict.correction.requestedAt)
+      );
+      resolutionsMap[key] = r.strategy;
+    });
+
+    const conflicts = detectConflicts(backup);
+
+    let skipShiftIds = new Set();
+    conflicts.shifts.forEach(c => {
+      const key = c.type + '|' + c.importedId;
+      const strategy = resolutionsMap[key] || 'skip';
+      if (strategy === 'skip') {
+        skipShiftIds.add(c.importedId);
+      }
+    });
+
+    const skipCorrectionKeys = new Set();
+    conflicts.corrections.forEach(c => {
+      const key = c.type + '|' + c.importedShiftId + '_' + c.correction.requestedAt;
+      const strategy = resolutionsMap[key] || 'skip';
+      if (strategy === 'skip') {
+        skipCorrectionKeys.add(c.importedShiftId + '|' + c.correction.requestedAt);
+      }
+    });
+
+    const skipDrugCodes = new Set();
+    conflicts.drugs.forEach(c => {
+      const key = c.type + '|' + c.drugCode;
+      const strategy = resolutionsMap[key] || 'skip';
+      if (strategy === 'skip' || strategy === 'merge') {
+        skipDrugCodes.add(c.drugCode);
+      }
+    });
+
+    const results = {
+      importedShifts: 0,
+      skippedShifts: 0,
+      importedInventories: 0,
+      importedDiscrepancies: 0,
+      importedDrugs: 0,
+      importedAuditLogs: 0,
+      messages: []
+    };
+
+    backup.data.discrepancies = sanitizeUsersForImport(backup.data);
+
+    const existingHistory = Storage.getShiftHistory();
+    const existingShiftIds = new Set(existingHistory.map(s => s.id));
+    const existingCurrentShift = Storage.getCurrentShift();
+    if (existingCurrentShift) existingShiftIds.add(existingCurrentShift.id);
+
+    const importedHistoryShifts = backup.data.shiftHistory || [];
+    importedHistoryShifts.forEach(shift => {
+      if (skipShiftIds.has(shift.id)) {
+        results.skippedShifts++;
+        results.messages.push(`跳过历史班次：${shift.name}`);
+        return;
+      }
+      if (!existingShiftIds.has(shift.id)) {
+        existingHistory.push(shift);
+        results.importedShifts++;
+        results.messages.push(`导入历史班次：${shift.name}`);
+      }
+    });
+    Storage.saveShiftHistory(existingHistory);
+
+    if (backup.data.currentShift && !skipShiftIds.has(backup.data.currentShift.id)) {
+      const curr = backup.data.currentShift;
+      const existingCurr = Storage.getCurrentShift();
+      if (!existingCurr || existingCurr.id === curr.id || !existingShiftIds.has(curr.id)) {
+        if (!existingCurr || existingCurr.status === Shift.STATUS.CLOSED) {
+          Storage.saveCurrentShift(curr);
+          results.importedShifts++;
+          results.messages.push(`恢复当前班次：${curr.name}`);
+        } else {
+          results.skippedShifts++;
+          results.messages.push(`跳过当前班次（已有活跃班次）：${curr.name}`);
+        }
+      }
+    } else if (backup.data.currentShift) {
+      results.skippedShifts++;
+      results.messages.push(`跳过当前班次（冲突策略）：${backup.data.currentShift.name}`);
+    }
+
+    const inventoryMap = backup.data.inventory || {};
+    Object.entries(inventoryMap).forEach(([shiftId, items]) => {
+      if (skipShiftIds.has(shiftId)) return;
+      const existing = Storage.getInventory(shiftId);
+      if (existing.length === 0) {
+        Storage.saveInventory(shiftId, items);
+        results.importedInventories++;
+      }
+    });
+
+    const discrepanciesMap = backup.data.discrepancies || {};
+    Object.entries(discrepanciesMap).forEach(([shiftId, discList]) => {
+      if (skipShiftIds.has(shiftId)) return;
+
+      const filteredDiscList = discList.map(d => {
+        if (d.corrections) {
+          d.corrections = d.corrections.filter(c => {
+            const key = shiftId + '|' + c.requestedAt;
+            return !skipCorrectionKeys.has(key);
+          });
+        }
+        return d;
+      });
+
+      const existing = Storage.getDiscrepancies(shiftId);
+      if (existing.length === 0) {
+        Storage.saveDiscrepancies(shiftId, filteredDiscList);
+        results.importedDiscrepancies++;
+      } else {
+        const existingDrugIds = new Set(existing.map(d => d.drugId));
+        filteredDiscList.forEach(d => {
+          if (!existingDrugIds.has(d.drugId)) {
+            existing.push(d);
+          }
+        });
+        Storage.saveDiscrepancies(shiftId, existing);
+        results.importedDiscrepancies++;
+      }
+    });
+
+    const existingDrugs = Storage.getDrugs();
+    const importedDrugs = backup.data.drugs || [];
+    const existingDrugCodes = new Set(existingDrugs.map(d => d.code));
+    importedDrugs.forEach(drug => {
+      if (skipDrugCodes.has(drug.code)) return;
+      if (!existingDrugCodes.has(drug.code)) {
+        existingDrugs.push(drug);
+        results.importedDrugs++;
+      }
+    });
+    Storage.saveDrugs(existingDrugs);
+
+    const existingLogs = Storage.getAuditLogs();
+    const sanitizedLogs = sanitizeAuditLogsForImport(backup.data.auditLogs || [], existingLogs);
+    const mergedLogs = sanitizedLogs.concat(existingLogs);
+    mergedLogs.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    Storage.set(Storage.KEYS.AUDIT_LOGS, mergedLogs);
+    results.importedAuditLogs = sanitizedLogs.length;
+
+    Storage.addAuditLog(
+      '导入数据备份',
+      `数据恢复完成：导入班次${results.importedShifts}个，跳过${results.skippedShifts}个；导入盘点${results.importedInventories}组；导入差异${results.importedDiscrepancies}组；导入药品${results.importedDrugs}种；导入审计日志${results.importedAuditLogs}条`,
+      user
+    );
+
+    return {
+      success: true,
+      results: results,
+      summary: `恢复完成：${results.importedShifts}个班次，${results.importedAuditLogs}条审计日志已导入`
+    };
+  }
+
+  function parseBackupFile(content) {
+    try {
+      const backup = JSON.parse(content);
+      const validation = validateBackup(backup);
+      if (!validation.valid) {
+        return { success: false, message: validation.reason };
+      }
+      const conflicts = detectConflicts(backup);
+      return {
+        success: true,
+        backup: backup,
+        conflicts: conflicts,
+        hasConflicts: conflicts.shifts.length > 0 || conflicts.corrections.length > 0 || conflicts.drugs.length > 0,
+        conflictCount: conflicts.shifts.length + conflicts.corrections.length + conflicts.drugs.length
+      };
+    } catch (e) {
+      return { success: false, message: '备份文件解析失败：' + e.message };
+    }
+  }
+
   return {
     generateShiftReport,
     downloadReport,
-    getAuditLogReport
+    getAuditLogReport,
+    createBackup,
+    downloadBackup,
+    validateBackup,
+    detectConflicts,
+    resolveConflictStrategy,
+    describeConflictResolution,
+    applyBackup,
+    parseBackupFile,
+    sanitizeUsersForImport,
+    sanitizeAuditLogsForImport
   };
 })();
