@@ -13,6 +13,7 @@ const App = (function() {
   let selectedDataBlocks = [];
   let backupPendingPreview = null;
   let backupPendingConflicts = null;
+  let backupPendingResolutions = [];
 
   function init() {
     Storage.initializeDemoData();
@@ -1067,10 +1068,11 @@ const App = (function() {
             </div>
 
             <div class="backup-detail-section">
-              <h4 style="margin:0 0 8px 0; color:#52c41a;">👁 预演恢复</h4>
+              <h4 style="margin:0 0 8px 0; color:#52c41a;">👁 冲突检测与预演</h4>
               <button class="btn btn-info btn-sm" onclick="App.previewBackupRestore()">
-                计算预演结果
+                检测冲突并计算预演
               </button>
+              <div id="backup-conflict-area" style="margin-top:12px;"></div>
               <div id="backup-preview-area" style="margin-top:8px;"></div>
             </div>
 
@@ -1131,20 +1133,62 @@ const App = (function() {
     const backupInfo = Storage.getBackupById(selectedBackupId);
     if (!backupInfo || !backupInfo.backupData) return;
 
-    const result = ExportModule.prePartialRestorePreview(
-      backupInfo.backupData,
-      selectedDataBlocks,
-      []
-    );
+    const conflicts = ExportModule.detectConflicts(backupInfo.backupData);
+    backupPendingConflicts = conflicts;
 
+    const conflictArea = document.getElementById('backup-conflict-area');
+    renderBackupConflictArea(conflictArea, conflicts, backupInfo);
+
+    const defaultResolutions = collectBackupConflictResolutions();
+    computeAndRenderPreview(defaultResolutions);
+  }
+
+  function refreshBackupPreview() {
+    const resolutions = collectBackupConflictResolutions();
+    computeAndRenderPreview(resolutions);
+  }
+
+  function computeAndRenderPreview(resolutions) {
+    const backupInfo = Storage.getBackupById(selectedBackupId);
+    if (!backupInfo || !backupInfo.backupData) return;
+
+    const allBlocks = ExportModule.getAllDataBlocks();
+    const isFull = selectedDataBlocks.length === allBlocks.length;
     const area = document.getElementById('backup-preview-area');
+
+    let result;
+    if (isFull) {
+      result = ExportModule.preRestorePreview(backupInfo.backupData, resolutions);
+    } else {
+      result = ExportModule.prePartialRestorePreview(
+        backupInfo.backupData,
+        selectedDataBlocks,
+        resolutions
+      );
+    }
+
+    backupPendingPreview = result.success ? result : null;
+    backupPendingResolutions = resolutions;
+
     if (result.success) {
+      const s = result.summary;
       area.innerHTML = `
-        <div style="padding:10px; background:#e6f7ff; border:1px solid #91d5ff; border-radius:4px; font-size:12px;">
-          <p style="margin:0 0 6px 0;"><strong>预演结果：</strong></p>
-          <p style="margin:0; color:#1890ff;">${result.summaryText}</p>
-          <p style="margin:6px 0 0 0; color:#595959; font-size:11px;">
-            选中数据块：${result.dataBlockLabels.join('、')}
+        <div style="padding:12px; background:#e6f7ff; border:1px solid #91d5ff; border-radius:4px;">
+          <p style="font-size:13px; margin-bottom:8px;"><strong>📊 预演结果（尚未写入，确认后才落库）：</strong></p>
+          <p style="font-size:12px; color:#1890ff; margin-bottom:8px;">${result.summaryText}</p>
+          <div style="display:flex; flex-wrap:wrap; gap:6px; font-size:12px;">
+            ${s.newShifts > 0 ? `<span style="background:#52c41a; color:#fff; padding:2px 8px; border-radius:10px;">新增班次 ${s.newShifts}</span>` : ''}
+            ${s.overwrittenShifts > 0 ? `<span style="background:#ff4d4f; color:#fff; padding:2px 8px; border-radius:10px;">覆盖班次 ${s.overwrittenShifts}</span>` : ''}
+            ${s.mergedShifts > 0 ? `<span style="background:#faad14; color:#fff; padding:2px 8px; border-radius:10px;">合并班次 ${s.mergedShifts}</span>` : ''}
+            ${s.skippedShifts > 0 ? `<span style="background:#8c8c8c; color:#fff; padding:2px 8px; border-radius:10px;">跳过 ${s.skippedShifts}</span>` : ''}
+            ${s.affectedInventories > 0 ? `<span style="background:#1890ff; color:#fff; padding:2px 8px; border-radius:10px;">影响盘点 ${s.affectedInventories}</span>` : ''}
+            ${s.affectedDiscrepancies > 0 ? `<span style="background:#722ed1; color:#fff; padding:2px 8px; border-radius:10px;">影响差异 ${s.affectedDiscrepancies}</span>` : ''}
+            ${s.newDrugs > 0 ? `<span style="background:#52c41a; color:#fff; padding:2px 8px; border-radius:10px;">新增药品 ${s.newDrugs}</span>` : ''}
+            ${s.overwrittenDrugs > 0 ? `<span style="background:#ff4d4f; color:#fff; padding:2px 8px; border-radius:10px;">覆盖药品 ${s.overwrittenDrugs}</span>` : ''}
+            ${s.importAuditLogs > 0 ? `<span style="background:#722ed1; color:#fff; padding:2px 8px; border-radius:10px;">导入审计 ${s.importAuditLogs}</span>` : ''}
+          </div>
+          <p style="font-size:11px; color:#595959; margin-top:10px;"><strong>冲突处理决定：</strong>共 ${resolutions.length} 项
+            ${resolutions.length > 0 ? `（覆盖:${resolutions.filter(r => r.strategy === 'overwrite').length} / 跳过:${resolutions.filter(r => r.strategy === 'skip').length} / 合并:${resolutions.filter(r => r.strategy === 'merge').length}）` : ''}
           </p>
         </div>
       `;
@@ -1153,8 +1197,118 @@ const App = (function() {
     }
   }
 
+  function renderBackupConflictArea(container, conflicts, backupInfo) {
+    const total = conflicts.shifts.length + conflicts.corrections.length + conflicts.drugs.length;
+
+    if (total === 0) {
+      container.innerHTML = `
+        <div class="alert alert-success" style="font-size:12px; margin:0;">
+          <strong>✓ 无冲突</strong>：备份与本地数据无重复班次/修正/药品冲突，可直接恢复。
+        </div>
+      `;
+      return;
+    }
+
+    let html = `
+      <div class="alert alert-error" style="font-size:12px; margin-bottom:10px;">
+        <strong>⚠️ 检测到 ${total} 项冲突，请逐项选择处理策略（改变后重新计算预演）：</strong>
+      </div>
+    `;
+
+    if (conflicts.shifts.length > 0) {
+      html += `<h5 style="margin:10px 0 6px; color:#ff4d4f; font-size:13px;">班次名称冲突 (${conflicts.shifts.length})</h5>`;
+      conflicts.shifts.forEach((c, idx) => {
+        html += `
+          <div style="background:#fafafa; padding:8px 10px; border-radius:4px; margin-bottom:6px; font-size:12px;">
+            <p style="margin-bottom:4px;"><strong>${c.importedName}</strong></p>
+            <p style="color:#8c8c8c; margin-bottom:6px;">备份：${c.imported.createdAtFormatted} | 本地：${c.existing.createdAtFormatted}</p>
+            <div style="display:flex; gap:12px; flex-wrap:wrap;">
+              <label style="font-size:12px; cursor:pointer;"><input type="radio" name="bk_shift_conflict_${idx}" value="skip" checked onchange="App.refreshBackupPreview()"> 跳过(保留本地)</label>
+              <label style="font-size:12px; cursor:pointer;"><input type="radio" name="bk_shift_conflict_${idx}" value="overwrite" onchange="App.refreshBackupPreview()"> 覆盖</label>
+              <label style="font-size:12px; cursor:pointer;"><input type="radio" name="bk_shift_conflict_${idx}" value="merge" onchange="App.refreshBackupPreview()"> 合并</label>
+            </div>
+          </div>
+        `;
+      });
+    }
+
+    if (conflicts.corrections.length > 0) {
+      html += `<h5 style="margin:10px 0 6px; color:#faad14; font-size:13px;">重复修正记录 (${conflicts.corrections.length})</h5>`;
+      conflicts.corrections.forEach((c, idx) => {
+        html += `
+          <div style="background:#fafafa; padding:8px 10px; border-radius:4px; margin-bottom:6px; font-size:12px;">
+            <p style="margin-bottom:4px;"><strong>${c.importedDiscrepancyDrug}</strong>: ${c.correction.oldActualQuantity} → ${c.correction.newActualQuantity}</p>
+            <p style="color:#8c8c8c; margin-bottom:6px;">申请人：${c.correction.requestedByName} | ${c.correction.requestedAtFormatted}</p>
+            <div style="display:flex; gap:12px; flex-wrap:wrap;">
+              <label style="font-size:12px; cursor:pointer;"><input type="radio" name="bk_corr_conflict_${idx}" value="skip" checked onchange="App.refreshBackupPreview()"> 跳过</label>
+              <label style="font-size:12px; cursor:pointer;"><input type="radio" name="bk_corr_conflict_${idx}" value="overwrite" onchange="App.refreshBackupPreview()"> 覆盖</label>
+              <label style="font-size:12px; cursor:pointer;"><input type="radio" name="bk_corr_conflict_${idx}" value="merge" onchange="App.refreshBackupPreview()"> 合并</label>
+            </div>
+          </div>
+        `;
+      });
+    }
+
+    if (conflicts.drugs.length > 0) {
+      html += `<h5 style="margin:10px 0 6px; color:#1890ff; font-size:13px;">药品内容冲突 (${conflicts.drugs.length})</h5>`;
+      conflicts.drugs.forEach((c, idx) => {
+        html += `
+          <div style="background:#fafafa; padding:8px 10px; border-radius:4px; margin-bottom:6px; font-size:12px;">
+            <p style="margin-bottom:4px;"><strong>${c.drugCode}</strong>: 本地「${c.existing.name}」 vs 备份「${c.imported.name}」</p>
+            <p style="color:#8c8c8c; margin-bottom:6px;">规格/数量不一致，保留本地或覆盖</p>
+            <div style="display:flex; gap:12px; flex-wrap:wrap;">
+              <label style="font-size:12px; cursor:pointer;"><input type="radio" name="bk_drug_conflict_${idx}" value="skip" checked onchange="App.refreshBackupPreview()"> 跳过(保留本地)</label>
+              <label style="font-size:12px; cursor:pointer;"><input type="radio" name="bk_drug_conflict_${idx}" value="overwrite" onchange="App.refreshBackupPreview()"> 覆盖</label>
+              <label style="font-size:12px; cursor:pointer;"><input type="radio" name="bk_drug_conflict_${idx}" value="merge" onchange="App.refreshBackupPreview()"> 合并</label>
+            </div>
+          </div>
+        `;
+      });
+    }
+
+    container.innerHTML = html;
+  }
+
+  function collectBackupConflictResolutions() {
+    const resolutions = [];
+    if (!backupPendingConflicts) return resolutions;
+
+    backupPendingConflicts.shifts.forEach((c, idx) => {
+      const radios = document.getElementsByName('bk_shift_conflict_' + idx);
+      let strategy = 'skip';
+      radios.forEach(r => { if (r.checked) strategy = r.value; });
+      resolutions.push(ExportModule.resolveConflictStrategy(c, strategy));
+    });
+    backupPendingConflicts.corrections.forEach((c, idx) => {
+      const radios = document.getElementsByName('bk_corr_conflict_' + idx);
+      let strategy = 'skip';
+      radios.forEach(r => { if (r.checked) strategy = r.value; });
+      resolutions.push(ExportModule.resolveConflictStrategy(c, strategy));
+    });
+    backupPendingConflicts.drugs.forEach((c, idx) => {
+      const radios = document.getElementsByName('bk_drug_conflict_' + idx);
+      let strategy = 'skip';
+      radios.forEach(r => { if (r.checked) strategy = r.value; });
+      resolutions.push(ExportModule.resolveConflictStrategy(c, strategy));
+    });
+    return resolutions;
+  }
+
   function applyBackupRestore() {
-    if (!confirm('确认执行恢复？此操作将用备份数据覆盖所选数据块。\n\n恢复失败会自动回滚，但仍建议确认备份后再操作。')) {
+    const resolutions = backupPendingConflicts
+      ? collectBackupConflictResolutions()
+      : [];
+    const total = resolutions.length;
+    const overwriteCount = resolutions.filter(r => r.strategy === 'overwrite').length;
+    const skipCount = resolutions.filter(r => r.strategy === 'skip').length;
+    const mergeCount = resolutions.filter(r => r.strategy === 'merge').length;
+
+    let confirmMsg = `确认执行恢复？\n\n恢复范围：${selectedDataBlocks.length}/${ExportModule.getAllDataBlocks().length} 个数据块`;
+    if (total > 0) {
+      confirmMsg += `\n\n冲突处理（共 ${total} 项）：\n  • 覆盖：${overwriteCount}\n  • 跳过：${skipCount}\n  • 合并：${mergeCount}`;
+    }
+    confirmMsg += '\n\n恢复失败会自动回滚，但仍建议确认备份后再操作。';
+    if (!confirm(confirmMsg)) {
       return;
     }
 
@@ -1174,17 +1328,27 @@ const App = (function() {
 
     let result;
     if (isFull) {
-      result = ExportModule.applyBackup(backupInfo.backupData, []);
+      result = ExportModule.applyBackup(backupInfo.backupData, resolutions);
     } else {
       result = ExportModule.applyPartialBackup(
         backupInfo.backupData,
         selectedDataBlocks,
-        []
+        resolutions
       );
     }
 
     if (result.success) {
-      alert('✅ ' + (result.summary || '恢复成功') + '\n\n恢复记录ID: ' + result.restoreRecordId);
+      const summaryText = result.summary || '恢复成功';
+      const record = result.restoreRecord;
+      let detailMsg = summaryText;
+      if (record && record.conflictResolutions && record.conflictResolutions.length > 0) {
+        detailMsg += `\n\n冲突处理记录：\n${record.conflictResolutions.slice(0, 5).map(r => `  • [${r.strategy}] ${r.description}`).join('\n')}`;
+        if (record.conflictResolutions.length > 5) {
+          detailMsg += `\n  （还有 ${record.conflictResolutions.length - 5} 项，详见恢复记录）`;
+        }
+      }
+      detailMsg += '\n\n恢复记录ID: ' + result.restoreRecordId;
+      alert('✅ ' + detailMsg);
       closeBackupDetail();
       location.reload();
     } else {
@@ -1977,6 +2141,9 @@ const App = (function() {
     toggleDataBlock,
     selectAllDataBlocks,
     previewBackupRestore,
+    refreshBackupPreview,
+    renderBackupConflictArea,
+    collectBackupConflictResolutions,
     applyBackupRestore,
     showImportBackupModal,
     handleImportBackupFile,
