@@ -1783,6 +1783,293 @@ const ExportModule = (function() {
     };
   }
 
+  function getDataBlockChangeSummary(backup, block) {
+    const diff = compareBackupWithCurrent(backup);
+    if (!diff.success) return null;
+    const d = diff.diff;
+
+    switch (block) {
+      case DATA_BLOCKS.SHIFTS:
+        return {
+          block: block,
+          label: getDataBlockLabel(block),
+          backupCount: d.shifts.backupCount,
+          currentCount: d.shifts.currentCount,
+          newItems: d.shifts.newShiftNames,
+          modifiedItems: d.shifts.modifiedShiftNames,
+          commonItems: d.shifts.commonShiftNames,
+          backupHasActive: d.shifts.backupHasActive,
+          currentHasActive: d.shifts.currentHasActive,
+          summary: `备份${d.shifts.backupCount}个班次 / 本地${d.shifts.currentCount}个，新增${d.shifts.newShiftNames.length}个，内容不同${d.shifts.modifiedShiftNames.length}个`
+        };
+      case DATA_BLOCKS.DRUGS:
+        return {
+          block: block,
+          label: getDataBlockLabel(block),
+          backupCount: d.drugs.backupCount,
+          currentCount: d.drugs.currentCount,
+          newItems: d.drugs.newDrugs.map(x => x.code + ' ' + x.name),
+          modifiedItems: d.drugs.modifiedDrugs.map(x => x.code + ' (本地:' + x.currentName + ' / 备份:' + x.backupName + ')'),
+          deletedItems: d.drugs.deletedDrugs.map(x => x.code + ' ' + x.name),
+          commonCount: d.drugs.commonCount,
+          summary: `备份${d.drugs.backupCount}种 / 本地${d.drugs.currentCount}种，新增${d.drugs.newDrugs.length}种，变更${d.drugs.modifiedDrugs.length}种，本地独有${d.drugs.deletedDrugs.length}种`
+        };
+      case DATA_BLOCKS.INVENTORY:
+        return {
+          block: block,
+          label: getDataBlockLabel(block),
+          backupShiftCount: d.inventory.backupShiftCount,
+          currentShiftCount: d.inventory.currentShiftCount,
+          affectedShiftNames: d.inventory.affectedShiftNames,
+          totalItemsBackup: d.inventory.totalItemsBackup,
+          totalItemsCurrent: d.inventory.totalItemsCurrent,
+          countedItemsBackup: d.inventory.countedItemsBackup,
+          countedItemsCurrent: d.inventory.countedItemsCurrent,
+          summary: `备份覆盖${d.inventory.backupShiftCount}个班次 / 本地${d.inventory.currentShiftCount}个，备份共${d.inventory.totalItemsBackup}条盘点记录，已盘点${d.inventory.countedItemsBackup}条`
+        };
+      case DATA_BLOCKS.DISCREPANCIES:
+        return {
+          block: block,
+          label: getDataBlockLabel(block),
+          backupShiftCount: d.discrepancies.backupShiftCount,
+          currentShiftCount: d.discrepancies.currentShiftCount,
+          backupTotal: d.discrepancies.backupTotal,
+          currentTotal: d.discrepancies.currentTotal,
+          backupPending: d.discrepancies.backupPending,
+          currentPending: d.discrepancies.currentPending,
+          backupResolved: d.discrepancies.backupResolved,
+          currentResolved: d.discrepancies.currentResolved,
+          backupCorrectionsTotal: d.corrections.backupTotal,
+          currentCorrectionsTotal: d.corrections.currentTotal,
+          backupCorrectionsPending: d.corrections.backupPending,
+          currentCorrectionsPending: d.corrections.currentPending,
+          summary: `差异：备份${d.discrepancies.backupTotal}项 / 本地${d.discrepancies.currentTotal}项；修正：备份${d.corrections.backupTotal}条 / 本地${d.corrections.currentTotal}条`
+        };
+      case DATA_BLOCKS.AUDIT_LOGS:
+        return {
+          block: block,
+          label: getDataBlockLabel(block),
+          backupCount: d.auditLogs.backupCount,
+          currentCount: d.auditLogs.currentCount,
+          willAddCount: d.auditLogs.willAddCount,
+          summary: `备份${d.auditLogs.backupCount}条 / 本地${d.auditLogs.currentCount}条，将新增${d.auditLogs.willAddCount}条（按ID去重后追加）`
+        };
+      default:
+        return null;
+    }
+  }
+
+  function getAllDataBlockChanges(backup) {
+    const blocks = getAllDataBlocks();
+    const changes = {};
+    blocks.forEach(block => {
+      changes[block] = getDataBlockChangeSummary(backup, block);
+    });
+    return changes;
+  }
+
+  function getConflictDetail(conflict) {
+    switch (conflict.type) {
+      case 'shift_name_conflict':
+        return {
+          type: conflict.type,
+          typeLabel: '班次名称冲突',
+          title: conflict.importedName,
+          severity: 'high',
+          imported: {
+            id: conflict.importedId,
+            name: conflict.importedName,
+            status: conflict.imported.status,
+            statusText: Shift.getStatusText ? Shift.getStatusText(conflict.imported.status) : conflict.imported.status,
+            createdAt: conflict.imported.createdAtFormatted,
+            createdBy: conflict.imported.createdByName,
+            summary: conflict.imported.summary
+          },
+          existing: {
+            id: conflict.existingId,
+            name: conflict.existingName,
+            status: conflict.existing.status,
+            statusText: Shift.getStatusText ? Shift.getStatusText(conflict.existing.status) : conflict.existing.status,
+            createdAt: conflict.existing.createdAtFormatted,
+            createdBy: conflict.existing.createdByName,
+            summary: conflict.existing.summary
+          },
+          strategies: [
+            { value: 'skip', label: '保留本地', description: '跳过该班次，保留本地现有数据不变' },
+            { value: 'overwrite', label: '覆盖本地', description: '用备份中的班次数据完全替换本地班次' },
+            { value: 'merge', label: '合并数据', description: '以本地为基础，合并备份中的摘要和状态信息' }
+          ],
+          defaultStrategy: 'skip'
+        };
+      case 'duplicate_correction':
+        return {
+          type: conflict.type,
+          typeLabel: '重复修正记录',
+          title: conflict.importedDiscrepancyDrug + ' 的修正申请',
+          severity: 'medium',
+          imported: {
+            shiftId: conflict.importedShiftId,
+            drugName: conflict.importedDiscrepancyDrug,
+            oldQty: conflict.correction.oldActualQuantity,
+            newQty: conflict.correction.newActualQuantity,
+            reason: conflict.correction.reason,
+            requestedBy: conflict.correction.requestedByName,
+            requestedAt: conflict.correction.requestedAtFormatted,
+            status: conflict.correction.status,
+            statusText: Discrepancy.getCorrectionStatusText ? Discrepancy.getCorrectionStatusText(conflict.correction.status) : conflict.correction.status
+          },
+          existing: {
+            shiftId: conflict.existingShiftId,
+            drugName: conflict.existingDiscrepancyDrug,
+            oldQty: conflict.existingCorrection.oldActualQuantity,
+            newQty: conflict.existingCorrection.newActualQuantity,
+            reason: conflict.existingCorrection.reason,
+            requestedBy: conflict.existingCorrection.requestedByName,
+            requestedAt: conflict.existingCorrection.requestedAtFormatted,
+            status: conflict.existingCorrection.status,
+            statusText: Discrepancy.getCorrectionStatusText ? Discrepancy.getCorrectionStatusText(conflict.existingCorrection.status) : conflict.existingCorrection.status
+          },
+          strategies: [
+            { value: 'skip', label: '保留本地', description: '保留本地修正记录，跳过备份中的' },
+            { value: 'overwrite', label: '覆盖本地', description: '用备份中的修正记录替换本地的' },
+            { value: 'merge', label: '同时保留', description: '两条都保留，可能产生重复记录' }
+          ],
+          defaultStrategy: 'skip'
+        };
+      case 'drug_content_conflict':
+        return {
+          type: conflict.type,
+          typeLabel: '药品内容冲突',
+          title: conflict.drugCode,
+          severity: 'medium',
+          imported: {
+            code: conflict.imported.code,
+            name: conflict.imported.name,
+            spec: conflict.imported.spec,
+            type: conflict.imported.type,
+            unit: conflict.imported.unit,
+            initialStock: conflict.imported.initialStock,
+            manufacturer: conflict.imported.manufacturer
+          },
+          existing: {
+            code: conflict.existing.code,
+            name: conflict.existing.name,
+            spec: conflict.existing.spec,
+            type: conflict.existing.type,
+            unit: conflict.existing.unit,
+            initialStock: conflict.existing.initialStock,
+            manufacturer: conflict.existing.manufacturer
+          },
+          diffFields: (function() {
+            const diffs = [];
+            if (conflict.imported.name !== conflict.existing.name) diffs.push({ field: '名称', imported: conflict.imported.name, existing: conflict.existing.name });
+            if (conflict.imported.spec !== conflict.existing.spec) diffs.push({ field: '规格', imported: conflict.imported.spec, existing: conflict.existing.spec });
+            if (conflict.imported.type !== conflict.existing.type) diffs.push({ field: '类型', imported: conflict.imported.type === 'controlled' ? '受控' : '普通', existing: conflict.existing.type === 'controlled' ? '受控' : '普通' });
+            if (conflict.imported.unit !== conflict.existing.unit) diffs.push({ field: '单位', imported: conflict.imported.unit, existing: conflict.existing.unit });
+            if (conflict.imported.initialStock !== conflict.existing.initialStock) diffs.push({ field: '初始库存', imported: conflict.imported.initialStock, existing: conflict.existing.initialStock });
+            return diffs;
+          })(),
+          strategies: [
+            { value: 'skip', label: '保留本地', description: '保留本地药品信息，不修改' },
+            { value: 'overwrite', label: '覆盖本地', description: '用备份中的药品信息覆盖本地' },
+            { value: 'merge', label: '跳过冲突', description: '保持本地内容，不做任何修改（同保留）' }
+          ],
+          defaultStrategy: 'skip'
+        };
+      default:
+        return {
+          type: conflict.type,
+          typeLabel: '未知冲突',
+          title: '未分类冲突',
+          severity: 'low',
+          strategies: [
+            { value: 'skip', label: '跳过', description: '跳过此项' }
+          ],
+          defaultStrategy: 'skip'
+        };
+    }
+  }
+
+  function getConflictsGrouped(backup) {
+    const rawConflicts = detectConflicts(backup);
+    const groups = [];
+
+    if (rawConflicts.shifts.length > 0) {
+      groups.push({
+        groupKey: 'shifts',
+        groupLabel: '班次名称冲突',
+        severity: 'high',
+        count: rawConflicts.shifts.length,
+        conflicts: rawConflicts.shifts.map(c => getConflictDetail(c))
+      });
+    }
+    if (rawConflicts.corrections.length > 0) {
+      groups.push({
+        groupKey: 'corrections',
+        groupLabel: '重复修正记录',
+        severity: 'medium',
+        count: rawConflicts.corrections.length,
+        conflicts: rawConflicts.corrections.map(c => getConflictDetail(c))
+      });
+    }
+    if (rawConflicts.drugs.length > 0) {
+      groups.push({
+        groupKey: 'drugs',
+        groupLabel: '药品内容冲突',
+        severity: 'medium',
+        count: rawConflicts.drugs.length,
+        conflicts: rawConflicts.drugs.map(c => getConflictDetail(c))
+      });
+    }
+
+    const totalCount = rawConflicts.shifts.length + rawConflicts.corrections.length + rawConflicts.drugs.length;
+
+    return {
+      hasConflicts: totalCount > 0,
+      totalCount: totalCount,
+      groups: groups,
+      highestSeverity: totalCount === 0 ? 'none' : (rawConflicts.shifts.length > 0 ? 'high' : 'medium')
+    };
+  }
+
+  function getRestoreRecordDetail(recordId) {
+    const records = Storage.getRestoreRecords();
+    const record = records.find(r => r.id === recordId);
+    if (!record) return null;
+
+    return {
+      record: record,
+      summary: record.results || {},
+      conflictResolutions: record.conflictResolutions || [],
+      dataBlocks: record.dataBlocks || [],
+      isUndoable: !record.undone && record.status === 'success'
+    };
+  }
+
+  function buildRestoreChangeSummary(record) {
+    if (!record || !record.results) return '';
+    const r = record.results;
+    const parts = [];
+
+    if (r.importedShifts) parts.push(`新增班次${r.importedShifts}个`);
+    if (r.overwrittenShifts) parts.push(`覆盖班次${r.overwrittenShifts}个`);
+    if (r.mergedShifts) parts.push(`合并班次${r.mergedShifts}个`);
+    if (r.skippedShifts) parts.push(`跳过班次${r.skippedShifts}个`);
+
+    if (r.importedInventories) parts.push(`影响盘点${r.importedInventories}个班次`);
+    if (r.importedDiscrepancies) parts.push(`影响差异${r.importedDiscrepancies}个班次`);
+
+    if (r.overwrittenCorrections) parts.push(`覆盖修正${r.overwrittenCorrections}条`);
+    if (r.mergedCorrections) parts.push(`合并修正${r.mergedCorrections}条`);
+
+    if (r.importedDrugs) parts.push(`新增药品${r.importedDrugs}种`);
+    if (r.overwrittenDrugs) parts.push(`覆盖药品${r.overwrittenDrugs}种`);
+
+    if (r.importedAuditLogs) parts.push(`导入审计${r.importedAuditLogs}条`);
+
+    return parts.join('，');
+  }
+
   return {
     generateShiftReport,
     downloadReport,
@@ -1809,6 +2096,12 @@ const ExportModule = (function() {
     createBackupWithInfo,
     applyPartialBackup,
     prePartialRestorePreview,
-    getLastRestoreInfo
+    getLastRestoreInfo,
+    getDataBlockChangeSummary,
+    getAllDataBlockChanges,
+    getConflictDetail,
+    getConflictsGrouped,
+    getRestoreRecordDetail,
+    buildRestoreChangeSummary
   };
 })();

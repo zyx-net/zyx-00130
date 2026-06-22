@@ -1005,6 +1005,8 @@ const App = (function() {
     }
   }
 
+  let restoreConsoleActiveTab = 'overview';
+
   function viewBackupDetail(backupId) {
     selectedBackupId = backupId;
     const backupInfo = Storage.getBackupById(backupId);
@@ -1013,84 +1015,101 @@ const App = (function() {
       return;
     }
 
-    const diffResult = ExportModule.compareBackupWithCurrent(backupInfo.backupData);
-    const diffText = ExportModule.generateDiffSummaryText(diffResult);
     const isPharmacist = Auth.isPharmacist();
     const allBlocks = ExportModule.getAllDataBlocks();
+    const blockChanges = ExportModule.getAllDataBlockChanges(backupInfo.backupData);
 
     if (selectedDataBlocks.length === 0) {
       selectedDataBlocks = allBlocks.slice();
     }
 
+    if (!backupPendingConflicts) {
+      const conflicts = ExportModule.detectConflicts(backupInfo.backupData);
+      backupPendingConflicts = conflicts;
+    }
+
+    const conflictGroups = ExportModule.getConflictsGrouped(backupInfo.backupData);
+
     const modal = document.getElementById('backup-detail-modal');
     modal.innerHTML = `
       <div class="modal-overlay" style="z-index:1000;">
-        <div class="modal" style="max-width:700px; max-height:85vh; overflow-y:auto;">
-          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
-            <h3 style="margin:0;">备份详情 - ${backupInfo.name || '未命名备份'}</h3>
-            <button class="btn btn-default btn-sm" onclick="App.closeBackupDetail()">关闭</button>
+        <div class="modal restore-console-modal">
+          <div class="restore-console-header">
+            <div>
+              <h3 style="margin:0 0 4px 0;">
+                <span style="margin-right:8px;">🔧</span>
+                恢复操作台 - ${backupInfo.name || '未命名备份'}
+              </h3>
+              <p style="font-size:12px; color:#8c8c8c; margin:0;">
+                创建时间：${backupInfo.createdAtFormatted} |
+                操作人：${backupInfo.createdBy ? backupInfo.createdBy.name : '未知'} |
+                版本：${backupInfo.version || '-'}
+                ${backupInfo.importedFrom ? ` | 来源：${backupInfo.importedFrom.name || '文件导入'}` : ''}
+              </p>
+            </div>
+            <div style="display:flex; gap:8px;">
+              ${conflictGroups.hasConflicts ? `
+                <span class="conflict-badge conflict-badge-${conflictGroups.highestSeverity}">
+                  ⚠️ ${conflictGroups.totalCount} 项冲突待处理
+                </span>
+              ` : `
+                <span class="conflict-badge conflict-badge-none">
+                  ✓ 无冲突
+                </span>
+              `}
+              <button class="btn btn-default btn-sm" onclick="App.closeBackupDetail()">关闭</button>
+            </div>
           </div>
 
-          <div class="backup-detail-section">
-            <p style="font-size:12px; color:#8c8c8c;">
-              创建时间：${backupInfo.createdAtFormatted} |
-              操作人：${backupInfo.createdBy ? backupInfo.createdBy.name : '未知'} |
-              版本：${backupInfo.version || '-'}
-            </p>
-            ${backupInfo.note ? `<p style="font-size:13px;"><strong>备注：</strong>${backupInfo.note}</p>` : ''}
+          ${backupInfo.note ? `
+            <div class="restore-note-bar">
+              📝 <strong>备份备注：</strong>${backupInfo.note}
+            </div>
+          ` : ''}
+
+          <div class="restore-console-tabs">
+            <div class="restore-tab ${restoreConsoleActiveTab === 'overview' ? 'active' : ''}"
+                 onclick="App.switchRestoreConsoleTab('overview')">
+              📊 恢复概览
+            </div>
+            <div class="restore-tab ${restoreConsoleActiveTab === 'datablocks' ? 'active' : ''}"
+                 onclick="App.switchRestoreConsoleTab('datablocks')">
+              📦 数据块选择
+            </div>
+            <div class="restore-tab ${restoreConsoleActiveTab === 'conflicts' ? 'active' : ''}"
+                 onclick="App.switchRestoreConsoleTab('conflicts')">
+              ⚔️ 冲突决策
+              ${conflictGroups.hasConflicts ? `<span class="restore-tab-badge">${conflictGroups.totalCount}</span>` : ''}
+            </div>
+            <div class="restore-tab ${restoreConsoleActiveTab === 'preview' ? 'active' : ''}"
+                 onclick="App.switchRestoreConsoleTab('preview')">
+              👁 执行预演
+            </div>
           </div>
 
-          <div class="backup-detail-section">
-            <h4 style="margin:0 0 8px 0; color:#1890ff;">📊 与当前数据差异对比</h4>
-            <pre style="background:#f6ffed; padding:12px; border-radius:4px; font-size:12px; white-space:pre-wrap; margin:0;">${diffText || '暂无差异数据'}</pre>
+          <div class="restore-console-body" id="restore-console-body">
+            ${renderRestoreConsoleContent(backupInfo, blockChanges, conflictGroups)}
           </div>
 
           ${isPharmacist ? `
-            <div class="backup-detail-section">
-              <h4 style="margin:0 0 8px 0; color:#faad14;">🎯 选择恢复的数据块</h4>
-              <p style="font-size:12px; color:#8c8c8c; margin-bottom:8px;">
-                取消勾选可只恢复部分数据，避免整包覆盖
-              </p>
-              <div style="display:flex; flex-direction:column; gap:6px;">
-                ${allBlocks.map(block => `
-                  <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
-                    <input type="checkbox"
-                           ${selectedDataBlocks.includes(block) ? 'checked' : ''}
-                           onchange="App.toggleDataBlock('${block}', this.checked)">
-                    ${ExportModule.getDataBlockLabel(block)}
-                  </label>
-                `).join('')}
+            <div class="restore-console-footer">
+              <div class="restore-footer-summary">
+                <span>已选 <strong>${selectedDataBlocks.length}/${allBlocks.length}</strong> 个数据块</span>
+                ${conflictGroups.hasConflicts ? `<span>冲突策略已设 <strong>${backupPendingResolutions.length || 0}/${conflictGroups.totalCount}</strong> 项</span>` : ''}
               </div>
-              <div style="margin-top:10px;">
-                <button class="btn btn-default btn-sm" onclick="App.selectAllDataBlocks(true)">全选</button>
-                <button class="btn btn-default btn-sm" onclick="App.selectAllDataBlocks(false)">全不选</button>
+              <div style="display:flex; gap:8px;">
+                <button class="btn btn-default" onclick="App.closeBackupDetail()">取消</button>
+                <button class="btn btn-success" onclick="App.applyBackupRestore()">
+                  确认执行恢复
+                </button>
               </div>
-            </div>
-
-            <div class="backup-detail-section">
-              <h4 style="margin:0 0 8px 0; color:#52c41a;">👁 冲突检测与预演</h4>
-              <button class="btn btn-info btn-sm" onclick="App.previewBackupRestore()">
-                检测冲突并计算预演
-              </button>
-              <div id="backup-conflict-area" style="margin-top:12px;"></div>
-              <div id="backup-preview-area" style="margin-top:8px;"></div>
-            </div>
-
-            <div class="alert alert-warning" style="font-size:12px; margin:16px 0;">
-              ⚠️ <strong>重要提示：</strong>
-              恢复前请确保当前没有进行中的盘点、待审批修正或未关班的班次。
-              恢复操作将先锁定系统，执行失败会自动回滚。
-            </div>
-
-            <div class="modal-actions">
-              <button class="btn btn-default" onclick="App.closeBackupDetail()">取消</button>
-              <button class="btn btn-success" onclick="App.applyBackupRestore()">
-                确认恢复 (${selectedDataBlocks.length}/${allBlocks.length} 个数据块)
-              </button>
             </div>
           ` : `
-            <div class="alert alert-info" style="font-size:12px; margin:16px 0;">
-              护士账号可查看备份详情，恢复操作需药师权限。
+            <div class="restore-console-footer">
+              <div class="alert alert-info" style="font-size:12px; margin:0; flex:1;">
+                护士账号可查看备份详情，恢复操作需药师权限。
+              </div>
+              <button class="btn btn-default" onclick="App.closeBackupDetail()">关闭</button>
             </div>
           `}
         </div>
@@ -1098,6 +1117,660 @@ const App = (function() {
     `;
 
     renderBackupHistory(document.getElementById('backup-subtab-content'));
+  }
+
+  function switchRestoreConsoleTab(tab) {
+    restoreConsoleActiveTab = tab;
+    const backupInfo = Storage.getBackupById(selectedBackupId);
+    if (!backupInfo || !backupInfo.backupData) return;
+
+    const blockChanges = ExportModule.getAllDataBlockChanges(backupInfo.backupData);
+    const conflictGroups = ExportModule.getConflictsGrouped(backupInfo.backupData);
+
+    const tabs = document.querySelectorAll('.restore-tab');
+    tabs.forEach(t => t.classList.remove('active'));
+    const activeTab = Array.from(tabs).find(t => t.textContent.includes(
+      tab === 'overview' ? '恢复概览' :
+      tab === 'datablocks' ? '数据块选择' :
+      tab === 'conflicts' ? '冲突决策' : '执行预演'
+    ));
+    if (activeTab) activeTab.classList.add('active');
+
+    const body = document.getElementById('restore-console-body');
+    if (body) {
+      body.innerHTML = renderRestoreConsoleContent(backupInfo, blockChanges, conflictGroups);
+    }
+  }
+
+  function renderRestoreConsoleContent(backupInfo, blockChanges, conflictGroups) {
+    switch (restoreConsoleActiveTab) {
+      case 'overview':
+        return renderRestoreOverviewTab(backupInfo, blockChanges, conflictGroups);
+      case 'datablocks':
+        return renderRestoreDataBlocksTab(backupInfo, blockChanges);
+      case 'conflicts':
+        return renderRestoreConflictsTab(backupInfo, conflictGroups);
+      case 'preview':
+        return renderRestorePreviewTab(backupInfo);
+      default:
+        return '';
+    }
+  }
+
+  function renderRestoreOverviewTab(backupInfo, blockChanges, conflictGroups) {
+    const allBlocks = ExportModule.getAllDataBlocks();
+
+    let blockCardsHtml = '';
+    allBlocks.forEach(block => {
+      const change = blockChanges[block];
+      const isSelected = selectedDataBlocks.includes(block);
+      const label = ExportModule.getDataBlockLabel(block);
+
+      blockCardsHtml += `
+        <div class="overview-block-card ${isSelected ? 'selected' : ''}"
+             onclick="App.toggleDataBlock('${block}', ${!isSelected})">
+          <div class="overview-block-header">
+            <span class="overview-block-icon">${getBlockIcon(block)}</span>
+            <span class="overview-block-title">${label}</span>
+            <label class="overview-block-checkbox">
+              <input type="checkbox" ${isSelected ? 'checked' : ''} onclick="event.stopPropagation()">
+            </label>
+          </div>
+          <div class="overview-block-summary">
+            ${change ? change.summary : '暂无数据'}
+          </div>
+          ${change && change.newItems && change.newItems.length > 0 ? `
+            <div class="overview-block-detail">
+              <span class="tag tag-new">+${change.newItems.length} 新增</span>
+              ${change.modifiedItems && change.modifiedItems.length > 0 ? `<span class="tag tag-modified">~${change.modifiedItems.length} 变更</span>` : ''}
+              ${change.deletedItems && change.deletedItems.length > 0 ? `<span class="tag tag-deleted">-${change.deletedItems.length} 本地独有</span>` : ''}
+            </div>
+          ` : ''}
+        </div>
+      `;
+    });
+
+    const businessConflicts = ExportModule.detectBusinessConflicts();
+
+    return `
+      <div class="restore-overview">
+        <div class="overview-section">
+          <h4 class="overview-section-title">📦 数据块一览（点击切换选中状态）</h4>
+          <div class="overview-block-grid">
+            ${blockCardsHtml}
+          </div>
+          <div style="margin-top:10px; display:flex; gap:8px;">
+            <button class="btn btn-default btn-sm" onclick="App.selectAllDataBlocks(true); App.refreshRestoreConsole();">全选</button>
+            <button class="btn btn-default btn-sm" onclick="App.selectAllDataBlocks(false); App.refreshRestoreConsole();">全不选</button>
+          </div>
+        </div>
+
+        ${businessConflicts.hasConflicts ? `
+          <div class="overview-section">
+            <h4 class="overview-section-title">⚠️ 业务状态提醒</h4>
+            <div class="business-warnings">
+              ${businessConflicts.warnings.map(w => `
+                <div class="business-warning-item">
+                  <span class="warning-dot"></span>
+                  ${w}
+                </div>
+              `).join('')}
+            </div>
+            <p style="font-size:12px; color:#faad14; margin-top:8px;">
+              💡 建议先处理完上述事项再执行恢复，避免数据冲突
+            </p>
+          </div>
+        ` : ''}
+
+        <div class="overview-section">
+          <h4 class="overview-section-title">📋 备份基本信息</h4>
+          <div class="backup-meta-grid">
+            <div class="meta-item">
+              <span class="meta-label">备份版本</span>
+              <span class="meta-value">${backupInfo.version || '-'}</span>
+            </div>
+            <div class="meta-item">
+              <span class="meta-label">创建时间</span>
+              <span class="meta-value">${backupInfo.createdAtFormatted}</span>
+            </div>
+            <div class="meta-item">
+              <span class="meta-label">创建人</span>
+              <span class="meta-value">${backupInfo.createdBy ? backupInfo.createdBy.name : '未知'}</span>
+            </div>
+            <div class="meta-item">
+              <span class="meta-label">班次数量</span>
+              <span class="meta-value">${backupInfo.summary ? backupInfo.summary.shiftCount : '-'}</span>
+            </div>
+            <div class="meta-item">
+              <span class="meta-label">药品数量</span>
+              <span class="meta-value">${backupInfo.summary ? backupInfo.summary.drugCount : '-'}</span>
+            </div>
+            <div class="meta-item">
+              <span class="meta-label">审计日志</span>
+              <span class="meta-value">${backupInfo.summary ? backupInfo.summary.auditLogCount : '-'}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderRestoreDataBlocksTab(backupInfo, blockChanges) {
+    const allBlocks = ExportModule.getAllDataBlocks();
+
+    let blocksHtml = '';
+    allBlocks.forEach(block => {
+      const change = blockChanges[block];
+      const isSelected = selectedDataBlocks.includes(block);
+      const label = ExportModule.getDataBlockLabel(block);
+
+      let detailHtml = '';
+      if (change) {
+        if (change.newItems && change.newItems.length > 0) {
+          detailHtml += `
+            <div class="block-detail-section">
+              <span class="block-detail-title">新增项 (${change.newItems.length})</span>
+              <div class="block-detail-items">
+                ${change.newItems.slice(0, 5).map(item => `<span class="block-detail-item tag tag-new">${item}</span>`).join('')}
+                ${change.newItems.length > 5 ? `<span class="block-detail-more">...还有 ${change.newItems.length - 5} 项</span>` : ''}
+              </div>
+            </div>
+          `;
+        }
+        if (change.modifiedItems && change.modifiedItems.length > 0) {
+          detailHtml += `
+            <div class="block-detail-section">
+              <span class="block-detail-title">变更项 (${change.modifiedItems.length})</span>
+              <div class="block-detail-items">
+                ${change.modifiedItems.slice(0, 5).map(item => `<span class="block-detail-item tag tag-modified">${item}</span>`).join('')}
+                ${change.modifiedItems.length > 5 ? `<span class="block-detail-more">...还有 ${change.modifiedItems.length - 5} 项</span>` : ''}
+              </div>
+            </div>
+          `;
+        }
+        if (change.deletedItems && change.deletedItems.length > 0) {
+          detailHtml += `
+            <div class="block-detail-section">
+              <span class="block-detail-title">本地独有 / 备份没有 (${change.deletedItems.length})</span>
+              <div class="block-detail-items">
+                ${change.deletedItems.slice(0, 5).map(item => `<span class="block-detail-item tag tag-deleted">${item}</span>`).join('')}
+                ${change.deletedItems.length > 5 ? `<span class="block-detail-more">...还有 ${change.deletedItems.length - 5} 项</span>` : ''}
+              </div>
+            </div>
+          `;
+        }
+      }
+
+      blocksHtml += `
+        <div class="datablock-panel ${isSelected ? 'active' : ''}">
+          <div class="datablock-panel-header" onclick="App.toggleDataBlock('${block}', ${!isSelected}); App.refreshRestoreConsole();">
+            <label class="datablock-checkbox">
+              <input type="checkbox" ${isSelected ? 'checked' : ''} onclick="event.stopPropagation(); App.toggleDataBlock('${block}', this.checked); App.refreshRestoreConsole();">
+            </label>
+            <span class="datablock-icon">${getBlockIcon(block)}</span>
+            <span class="datablock-name">${label}</span>
+            <span class="datablock-summary">${change ? change.summary : ''}</span>
+            <span class="datablock-toggle">${isSelected ? '▾' : '▸'}</span>
+          </div>
+          ${isSelected ? `
+            <div class="datablock-panel-body">
+              ${detailHtml || '<p style="font-size:12px; color:#8c8c8c;">该数据块无变更项</p>'}
+            </div>
+          ` : ''}
+        </div>
+      `;
+    });
+
+    return `
+      <div class="restore-datablocks">
+        <div class="datablocks-header">
+          <p style="font-size:13px; color:#595959; margin:0 0 8px 0;">
+            选择需要恢复的数据块。取消勾选的数据块将保持本地原状，不会被备份覆盖。
+          </p>
+          <div style="display:flex; gap:8px;">
+            <button class="btn btn-default btn-sm" onclick="App.selectAllDataBlocks(true); App.refreshRestoreConsole();">全选</button>
+            <button class="btn btn-default btn-sm" onclick="App.selectAllDataBlocks(false); App.refreshRestoreConsole();">全不选</button>
+          </div>
+        </div>
+        <div class="datablocks-list">
+          ${blocksHtml}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderRestoreConflictsTab(backupInfo, conflictGroups) {
+    if (!conflictGroups.hasConflicts) {
+      return `
+        <div class="no-conflicts-container">
+          <div class="no-conflicts-icon">✅</div>
+          <h4 style="margin:12px 0 8px 0; color:#52c41a;">无冲突检测</h4>
+          <p style="font-size:13px; color:#8c8c8c; margin:0;">
+            备份数据与本地数据无冲突项，可以直接执行恢复。
+          </p>
+        </div>
+      `;
+    }
+
+    let groupsHtml = '';
+    conflictGroups.groups.forEach((group, groupIdx) => {
+      let conflictsHtml = '';
+      group.conflicts.forEach((conflict, conflictIdx) => {
+        const currentStrategy = getConflictResolutionStrategy(group.groupKey, conflictIdx);
+        const currentStrategyLabel = conflict.strategies.find(s => s.value === currentStrategy)?.label || '保留本地';
+
+        let compareHtml = '';
+        if (conflict.type === 'shift_name_conflict') {
+          compareHtml = `
+            <div class="conflict-compare">
+              <div class="conflict-compare-side">
+                <div class="conflict-side-label">📤 备份版本</div>
+                <div class="conflict-side-content">
+                  <p><strong>状态：</strong>${conflict.imported.statusText}</p>
+                  <p><strong>创建：</strong>${conflict.imported.createdAt} (${conflict.imported.createdBy || '未知'})</p>
+                  ${conflict.imported.summary ? `<p><strong>差异数：</strong>${conflict.imported.summary.discrepancies || 0} 项</p>` : ''}
+                </div>
+              </div>
+              <div class="conflict-compare-vs">VS</div>
+              <div class="conflict-compare-side">
+                <div class="conflict-side-label local">📁 本地版本</div>
+                <div class="conflict-side-content">
+                  <p><strong>状态：</strong>${conflict.existing.statusText}</p>
+                  <p><strong>创建：</strong>${conflict.existing.createdAt} (${conflict.existing.createdBy || '未知'})</p>
+                  ${conflict.existing.summary ? `<p><strong>差异数：</strong>${conflict.existing.summary.discrepancies || 0} 项</p>` : ''}
+                </div>
+              </div>
+            </div>
+          `;
+        } else if (conflict.type === 'drug_content_conflict') {
+          compareHtml = `
+            <div class="conflict-compare">
+              <div class="conflict-compare-side">
+                <div class="conflict-side-label">📤 备份版本</div>
+                <div class="conflict-side-content">
+                  ${conflict.diffFields.map(f => `
+                    <p><strong>${f.field}：</strong>${f.imported}</p>
+                  `).join('')}
+                </div>
+              </div>
+              <div class="conflict-compare-vs">VS</div>
+              <div class="conflict-compare-side">
+                <div class="conflict-side-label local">📁 本地版本</div>
+                <div class="conflict-side-content">
+                  ${conflict.diffFields.map(f => `
+                    <p><strong>${f.field}：</strong>${f.existing}</p>
+                  `).join('')}
+                </div>
+              </div>
+            </div>
+          `;
+        } else if (conflict.type === 'duplicate_correction') {
+          compareHtml = `
+            <div class="conflict-compare">
+              <div class="conflict-compare-side">
+                <div class="conflict-side-label">📤 备份版本</div>
+                <div class="conflict-side-content">
+                  <p><strong>变更：</strong>${conflict.imported.oldQty} → ${conflict.imported.newQty}</p>
+                  <p><strong>申请人：</strong>${conflict.imported.requestedBy}</p>
+                  <p><strong>时间：</strong>${conflict.imported.requestedAt}</p>
+                  <p><strong>状态：</strong>${conflict.imported.statusText}</p>
+                  ${conflict.imported.reason ? `<p><strong>原因：</strong>${conflict.imported.reason}</p>` : ''}
+                </div>
+              </div>
+              <div class="conflict-compare-vs">VS</div>
+              <div class="conflict-compare-side">
+                <div class="conflict-side-label local">📁 本地版本</div>
+                <div class="conflict-side-content">
+                  <p><strong>变更：</strong>${conflict.existing.oldQty} → ${conflict.existing.newQty}</p>
+                  <p><strong>申请人：</strong>${conflict.existing.requestedBy}</p>
+                  <p><strong>时间：</strong>${conflict.existing.requestedAt}</p>
+                  <p><strong>状态：</strong>${conflict.existing.statusText}</p>
+                  ${conflict.existing.reason ? `<p><strong>原因：</strong>${conflict.existing.reason}</p>` : ''}
+                </div>
+              </div>
+            </div>
+          `;
+        }
+
+        conflictsHtml += `
+          <div class="conflict-item conflict-severity-${conflict.severity}">
+            <div class="conflict-item-header">
+              <span class="conflict-severity-dot"></span>
+              <span class="conflict-item-title">${conflict.title}</span>
+              <span class="conflict-current-strategy">当前：${currentStrategyLabel}</span>
+            </div>
+            ${compareHtml}
+            <div class="conflict-strategies">
+              <span class="conflict-strategies-label">处理策略：</span>
+              <div class="conflict-strategy-buttons">
+                ${conflict.strategies.map(s => `
+                  <button class="conflict-strategy-btn ${currentStrategy === s.value ? 'active' : ''}"
+                          onclick="App.setConflictStrategy('${group.groupKey}', ${conflictIdx}, '${s.value}')"
+                          title="${s.description}">
+                    ${s.label}
+                  </button>
+                `).join('')}
+              </div>
+            </div>
+          </div>
+        `;
+      });
+
+      groupsHtml += `
+        <div class="conflict-group">
+          <div class="conflict-group-header">
+            <span class="conflict-group-title">${group.groupLabel}</span>
+            <span class="conflict-group-count">${group.count} 项</span>
+            <div style="margin-left:auto; display:flex; gap:4px;">
+              ${group.conflicts[0].strategies.map(s => `
+                <button class="btn btn-xs btn-default"
+                        onclick="App.setGroupStrategy('${group.groupKey}', '${s.value}')">
+                  全部${s.label}
+                </button>
+              `).join('')}
+            </div>
+          </div>
+          <div class="conflict-group-body">
+            ${conflictsHtml}
+          </div>
+        </div>
+      `;
+    });
+
+    return `
+      <div class="restore-conflicts">
+        <div class="conflicts-header">
+          <p style="font-size:13px; color:#595959; margin:0 0 8px 0;">
+            共检测到 <strong>${conflictGroups.totalCount}</strong> 项冲突。请逐项决定处理策略，或使用分组批量设置。
+          </p>
+          <div style="display:flex; gap:4px;">
+            <button class="btn btn-xs btn-default" onclick="App.setAllConflictStrategy('skip')">全部保留本地</button>
+            <button class="btn btn-xs btn-warning" onclick="App.setAllConflictStrategy('overwrite')">全部覆盖</button>
+            <button class="btn btn-xs btn-info" onclick="App.setAllConflictStrategy('merge')">全部合并</button>
+          </div>
+        </div>
+        <div class="conflicts-list">
+          ${groupsHtml}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderRestorePreviewTab(backupInfo) {
+    const allBlocks = ExportModule.getAllDataBlocks();
+    const isFull = selectedDataBlocks.length === allBlocks.length;
+
+    let resolutions = [];
+    if (backupPendingConflicts) {
+      resolutions = collectBackupConflictResolutions();
+    }
+
+    let previewResult = null;
+    if (isFull) {
+      previewResult = ExportModule.preRestorePreview(backupInfo.backupData, resolutions);
+    } else if (selectedDataBlocks.length > 0) {
+      previewResult = ExportModule.prePartialRestorePreview(
+        backupInfo.backupData,
+        selectedDataBlocks,
+        resolutions
+      );
+    }
+
+    if (!previewResult || !previewResult.success) {
+      return `
+        <div class="preview-empty">
+          <p style="font-size:13px; color:#8c8c8c;">
+            ${selectedDataBlocks.length === 0 ? '请先选择至少一个数据块' : '正在生成预演结果...'}
+          </p>
+          ${selectedDataBlocks.length > 0 ? `
+            <button class="btn btn-primary btn-sm" onclick="App.refreshRestoreConsole()">
+              重新计算预演
+            </button>
+          ` : ''}
+        </div>
+      `;
+    }
+
+    const s = previewResult.summary;
+
+    return `
+      <div class="restore-preview">
+        <div class="preview-summary-card">
+          <div class="preview-summary-title">
+            <span>📊 恢复预演结果</span>
+            <span class="preview-note">（尚未写入，确认后才落库）</span>
+          </div>
+          <div class="preview-stats">
+            <div class="preview-stat stat-new">
+              <div class="preview-stat-value">${s.newShifts || 0}</div>
+              <div class="preview-stat-label">新增班次</div>
+            </div>
+            <div class="preview-stat stat-overwrite">
+              <div class="preview-stat-value">${s.overwrittenShifts || 0}</div>
+              <div class="preview-stat-label">覆盖班次</div>
+            </div>
+            <div class="preview-stat stat-merge">
+              <div class="preview-stat-value">${s.mergedShifts || 0}</div>
+              <div class="preview-stat-label">合并班次</div>
+            </div>
+            <div class="preview-stat stat-skip">
+              <div class="preview-stat-value">${s.skippedShifts || 0}</div>
+              <div class="preview-stat-label">跳过班次</div>
+            </div>
+            <div class="preview-stat stat-drug">
+              <div class="preview-stat-value">${(s.newDrugs || 0) + (s.overwrittenDrugs || 0)}</div>
+              <div class="preview-stat-label">药品变动</div>
+            </div>
+            <div class="preview-stat stat-audit">
+              <div class="preview-stat-value">${s.importAuditLogs || 0}</div>
+              <div class="preview-stat-label">新增审计</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="preview-detail-card">
+          <h5 class="preview-detail-title">详细变更清单</h5>
+
+          ${previewResult.preview && previewResult.preview.shifts ? `
+            <div class="preview-section">
+              <div class="preview-section-title">🚑 班次变更</div>
+              ${previewResult.preview.shifts.new.length > 0 ? `
+                <div class="preview-item-row">
+                  <span class="preview-item-label new">新增 (${previewResult.preview.shifts.new.length})</span>
+                  <span class="preview-item-values">
+                    ${previewResult.preview.shifts.new.map(s => s.name).join('、')}
+                  </span>
+                </div>
+              ` : ''}
+              ${previewResult.preview.shifts.overwrite.length > 0 ? `
+                <div class="preview-item-row">
+                  <span class="preview-item-label overwrite">覆盖 (${previewResult.preview.shifts.overwrite.length})</span>
+                  <span class="preview-item-values">
+                    ${previewResult.preview.shifts.overwrite.map(s => s.name + '(本地:' + s.existingName + ')').join('、')}
+                  </span>
+                </div>
+              ` : ''}
+              ${previewResult.preview.shifts.merge.length > 0 ? `
+                <div class="preview-item-row">
+                  <span class="preview-item-label merge">合并 (${previewResult.preview.shifts.merge.length})</span>
+                  <span class="preview-item-values">
+                    ${previewResult.preview.shifts.merge.map(s => s.name).join('、')}
+                  </span>
+                </div>
+              ` : ''}
+              ${previewResult.preview.shifts.skip.length > 0 ? `
+                <div class="preview-item-row">
+                  <span class="preview-item-label skip">跳过 (${previewResult.preview.shifts.skip.length})</span>
+                  <span class="preview-item-values">
+                    ${previewResult.preview.shifts.skip.map(s => s.name).join('、')}
+                  </span>
+                </div>
+              ` : ''}
+            </div>
+          ` : ''}
+
+          ${previewResult.preview && previewResult.preview.drugs ? `
+            <div class="preview-section">
+              <div class="preview-section-title">💊 药品变更</div>
+              ${previewResult.preview.drugs.new.length > 0 ? `
+                <div class="preview-item-row">
+                  <span class="preview-item-label new">新增 (${previewResult.preview.drugs.new.length})</span>
+                  <span class="preview-item-values">
+                    ${previewResult.preview.drugs.new.map(d => d.code + ' ' + d.name).join('、')}
+                  </span>
+                </div>
+              ` : ''}
+              ${previewResult.preview.drugs.overwrite.length > 0 ? `
+                <div class="preview-item-row">
+                  <span class="preview-item-label overwrite">覆盖 (${previewResult.preview.drugs.overwrite.length})</span>
+                  <span class="preview-item-values">
+                    ${previewResult.preview.drugs.overwrite.map(d => d.code).join('、')}
+                  </span>
+                </div>
+              ` : ''}
+              ${previewResult.preview.drugs.skip.length > 0 ? `
+                <div class="preview-item-row">
+                  <span class="preview-item-label skip">跳过/保留本地 (${previewResult.preview.drugs.skip.length})</span>
+                  <span class="preview-item-values">
+                    ${previewResult.preview.drugs.skip.map(d => d.code).join('、')}
+                  </span>
+                </div>
+              ` : ''}
+            </div>
+          ` : ''}
+
+          ${previewResult.preview && previewResult.preview.inventories ? `
+            <div class="preview-section">
+              <div class="preview-section-title">📋 盘点结果</div>
+              <p style="font-size:12px; color:#595959;">
+                将影响 ${previewResult.preview.inventories.affectedShiftIds.length} 个班次的盘点数据
+              </p>
+            </div>
+          ` : ''}
+
+          ${previewResult.preview && previewResult.preview.discrepancies ? `
+            <div class="preview-section">
+              <div class="preview-section-title">🔍 差异与修正</div>
+              <p style="font-size:12px; color:#595959;">
+                将影响 ${previewResult.preview.discrepancies.affectedShiftIds.length} 个班次的差异记录
+                ${previewResult.preview.corrections ? `（覆盖${previewResult.preview.corrections.overwrite}条修正 / 合并${previewResult.preview.corrections.merge}条修正）` : ''}
+              </p>
+            </div>
+          ` : ''}
+        </div>
+
+        <div class="preview-summary-text">
+          ${previewResult.summaryText || ''}
+        </div>
+      </div>
+    `;
+  }
+
+  function getBlockIcon(block) {
+    switch (block) {
+      case 'shifts': return '🚑';
+      case 'drugs': return '💊';
+      case 'inventory': return '📋';
+      case 'discrepancies': return '🔍';
+      case 'auditLogs': return '📝';
+      default: return '📦';
+    }
+  }
+
+  function refreshRestoreConsole() {
+    const backupInfo = Storage.getBackupById(selectedBackupId);
+    if (!backupInfo || !backupInfo.backupData) return;
+
+    const blockChanges = ExportModule.getAllDataBlockChanges(backupInfo.backupData);
+    const conflictGroups = ExportModule.getConflictsGrouped(backupInfo.backupData);
+
+    const body = document.getElementById('restore-console-body');
+    if (body) {
+      body.innerHTML = renderRestoreConsoleContent(backupInfo, blockChanges, conflictGroups);
+    }
+  }
+
+  function getConflictResolutionStrategy(groupKey, index) {
+    if (!backupPendingConflicts) return 'skip';
+
+    let rawConflict = null;
+    if (groupKey === 'shifts') {
+      rawConflict = backupPendingConflicts.shifts[index];
+    } else if (groupKey === 'corrections') {
+      rawConflict = backupPendingConflicts.corrections[index];
+    } else if (groupKey === 'drugs') {
+      rawConflict = backupPendingConflicts.drugs[index];
+    }
+
+    if (!rawConflict) return 'skip';
+
+    const resolution = backupPendingResolutions.find(r => {
+      const c = r.conflict;
+      if (c.type !== rawConflict.type) return false;
+      if (c.importedId && c.importedId === rawConflict.importedId) return true;
+      if (c.drugCode && c.drugCode === rawConflict.drugCode) return true;
+      if (c.correction && rawConflict.correction &&
+          c.correction.requestedAt === rawConflict.correction.requestedAt &&
+          c.correction.requestedBy === rawConflict.correction.requestedBy) return true;
+      return false;
+    });
+
+    return resolution ? resolution.strategy : 'skip';
+  }
+
+  function setConflictStrategy(groupKey, index, strategy) {
+    if (!backupPendingConflicts) return;
+
+    let rawConflict = null;
+    if (groupKey === 'shifts') {
+      rawConflict = backupPendingConflicts.shifts[index];
+    } else if (groupKey === 'corrections') {
+      rawConflict = backupPendingConflicts.corrections[index];
+    } else if (groupKey === 'drugs') {
+      rawConflict = backupPendingConflicts.drugs[index];
+    }
+
+    if (!rawConflict) return;
+
+    backupPendingResolutions = backupPendingResolutions.filter(r => {
+      const c = r.conflict;
+      if (c.type !== rawConflict.type) return true;
+      if (c.importedId && c.importedId === rawConflict.importedId) return false;
+      if (c.drugCode && c.drugCode === rawConflict.drugCode) return false;
+      if (c.correction && rawConflict.correction &&
+          c.correction.requestedAt === rawConflict.correction.requestedAt &&
+          c.correction.requestedBy === rawConflict.correction.requestedBy) return false;
+      return true;
+    });
+
+    backupPendingResolutions.push(ExportModule.resolveConflictStrategy(rawConflict, strategy));
+
+    refreshRestoreConsole();
+  }
+
+  function setGroupStrategy(groupKey, strategy) {
+    if (!backupPendingConflicts) return;
+
+    let conflicts = [];
+    if (groupKey === 'shifts') {
+      conflicts = backupPendingConflicts.shifts;
+    } else if (groupKey === 'corrections') {
+      conflicts = backupPendingConflicts.corrections;
+    } else if (groupKey === 'drugs') {
+      conflicts = backupPendingConflicts.drugs;
+    }
+
+    conflicts.forEach((c, idx) => {
+      setConflictStrategy(groupKey, idx, strategy);
+    });
+  }
+
+  function setAllConflictStrategy(strategy) {
+    if (!backupPendingConflicts) return;
+
+    ['shifts', 'corrections', 'drugs'].forEach(groupKey => {
+      setGroupStrategy(groupKey, strategy);
+    });
   }
 
   function closeBackupDetail() {
@@ -1481,65 +2154,286 @@ const App = (function() {
     reader.readAsText(file, 'UTF-8');
   }
 
+  let selectedRestoreRecordId = null;
+
   function renderRestoreRecordsView(container) {
     const records = ExportModule.getRestoreRecords();
+    const lastInfo = ExportModule.getLastRestoreInfo();
+    const canUndo = lastInfo && lastInfo.hasUndoableSnapshot && Auth.canUndoRestore();
 
     container.innerHTML = `
       <div class="card">
-        <h3>恢复操作记录</h3>
-        <p style="font-size:12px; color:#8c8c8c; margin-bottom:12px;">
-          共 ${records.length} 条恢复记录（按时间倒序）
-        </p>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+          <h3 style="margin:0;">恢复操作记录</h3>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span style="font-size:12px; color:#8c8c8c;">共 ${records.length} 条记录</span>
+            ${canUndo ? `
+              <button class="btn btn-warning btn-sm" onclick="App.handleUndoRestore()">
+                ↩️ 撤回最近恢复
+              </button>
+            ` : ''}
+          </div>
+        </div>
+
         ${records.length === 0 ? `
           <div class="empty-state">暂无恢复操作记录</div>
         ` : `
-          <table style="width:100%; font-size:12px;">
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>操作人</th>
-                <th>类型</th>
-                <th>数据块</th>
-                <th>结果</th>
-                <th>撤回</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${records.map(r => `
-                <tr>
-                  <td style="white-space:nowrap;">${r.timestampFormatted}</td>
-                  <td>${r.restoredBy ? r.restoredBy.name : '-'}</td>
-                  <td>${r.isPartial ? '部分恢复' : '完整恢复'}</td>
-                  <td style="font-size:11px;">
-                    ${r.dataBlocks ? r.dataBlocks.map(b => ExportModule.getDataBlockLabel(b)).join('、') : '-'}
-                  </td>
-                  <td>
-                    ${r.status === 'failed'
-                      ? `<span style="color:#ff4d4f;">失败</span><br><span style="font-size:10px; color:#8c8c8c;">${r.errorMessage || ''}</span>`
-                      : (r.undone ? '<span style="color:#8c8c8c;">已撤回</span>' : '<span style="color:#52c41a;">成功</span>')}
-                  </td>
-                  <td>
-                    ${r.undone && r.undoneAt
-                      ? `${r.undoneAtFormatted}<br><span style="font-size:10px;">${r.undoneBy ? r.undoneBy.name : ''}</span>`
-                      : '-'}
-                  </td>
-                </tr>
-                ${r.results ? `
-                  <tr>
-                    <td colspan="6" style="background:#fafafa; font-size:11px; padding:6px 12px; color:#595959;">
-                      结果：班次${r.results.importedShifts + r.results.overwrittenShifts + r.results.mergedShifts}个
-                      （新增${r.results.importedShifts}/覆盖${r.results.overwrittenShifts}/合并${r.results.mergedShifts}）
-                      | 药品${r.results.importedDrugs + r.results.overwrittenDrugs}种
-                      | 审计日志${r.results.importedAuditLogs}条
-                    </td>
-                  </tr>
-                ` : ''}
-              `).join('')}
-            </tbody>
-          </table>
+          <div class="restore-records-list">
+            ${records.map(r => renderRestoreRecordCard(r)).join('')}
+          </div>
         `}
       </div>
+
+      <div id="restore-record-detail-modal"></div>
     `;
+  }
+
+  function renderRestoreRecordCard(record) {
+    const isSelected = selectedRestoreRecordId === record.id;
+    const changeSummary = ExportModule.buildRestoreChangeSummary(record);
+    const isSuccess = record.status === 'success';
+    const isUndone = record.undone;
+
+    let statusClass = 'record-status-success';
+    let statusText = '恢复成功';
+    if (!isSuccess) {
+      statusClass = 'record-status-failed';
+      statusText = '恢复失败';
+    } else if (isUndone) {
+      statusClass = 'record-status-undone';
+      statusText = '已撤回';
+    }
+
+    return `
+      <div class="restore-record-card ${isSelected ? 'selected' : ''} ${isUndone ? 'undone' : ''}"
+           onclick="App.viewRestoreRecordDetail('${record.id}')">
+        <div class="record-card-header">
+          <div class="record-card-title">
+            <span class="record-status-badge ${statusClass}">${statusText}</span>
+            <span class="record-time">${record.timestampFormatted}</span>
+          </div>
+          <div class="record-card-meta">
+            <span class="record-operator">${record.restoredBy ? record.restoredBy.name : '未知'}</span>
+            <span class="record-type">${record.isPartial ? '部分恢复' : '完整恢复'}</span>
+          </div>
+        </div>
+        <div class="record-card-body">
+          <p class="record-summary">${changeSummary || '无详细变更记录'}</p>
+          <div class="record-tags">
+            ${record.dataBlocks ? record.dataBlocks.map(b => `
+              <span class="record-tag">${ExportModule.getDataBlockLabel(b)}</span>
+            `).join('') : ''}
+            ${record.conflictResolutions && record.conflictResolutions.length > 0 ? `
+              <span class="record-tag record-tag-conflict">
+                冲突决策 ${record.conflictResolutions.length} 项
+              </span>
+            ` : ''}
+          </div>
+        </div>
+        ${isUndone && record.undoneBy ? `
+          <div class="record-card-footer">
+            <span style="font-size:11px; color:#8c8c8c;">
+              由 ${record.undoneBy.name} 于 ${record.undoneAtFormatted} 撤回
+            </span>
+          </div>
+        ` : ''}
+        ${!isSuccess && record.errorMessage ? `
+          <div class="record-card-footer record-error">
+            错误：${record.errorMessage}
+          </div>
+        ` : ''}
+      </div>
+    `;
+  }
+
+  function viewRestoreRecordDetail(recordId) {
+    selectedRestoreRecordId = recordId;
+    const detail = ExportModule.getRestoreRecordDetail(recordId);
+    if (!detail) {
+      alert('恢复记录不存在');
+      return;
+    }
+
+    const record = detail.record;
+    const changeSummary = ExportModule.buildRestoreChangeSummary(record);
+
+    const modal = document.getElementById('restore-record-detail-modal');
+    modal.innerHTML = `
+      <div class="modal-overlay" style="z-index:1000;">
+        <div class="modal" style="max-width:600px; max-height:85vh; overflow-y:auto;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+            <h3 style="margin:0;">📋 恢复记录详情</h3>
+            <button class="btn btn-default btn-sm" onclick="App.closeRestoreRecordDetail()">关闭</button>
+          </div>
+
+          <div class="record-detail-section">
+            <h4 style="margin:0 0 8px 0; font-size:14px; color:#262626;">基本信息</h4>
+            <div class="detail-grid">
+              <div class="detail-item">
+                <span class="detail-label">记录ID</span>
+                <span class="detail-value">${record.id}</span>
+              </div>
+              <div class="detail-item">
+                <span class="detail-label">执行时间</span>
+                <span class="detail-value">${record.timestampFormatted}</span>
+              </div>
+              <div class="detail-item">
+                <span class="detail-label">操作人</span>
+                <span class="detail-value">${record.restoredBy ? record.restoredBy.name + ' (' + record.restoredBy.role + ')' : '未知'}</span>
+              </div>
+              <div class="detail-item">
+                <span class="detail-label">恢复类型</span>
+                <span class="detail-value">${record.isPartial ? '部分恢复' : '完整恢复'}</span>
+              </div>
+              <div class="detail-item">
+                <span class="detail-label">状态</span>
+                <span class="detail-value">
+                  ${record.status === 'success'
+                    ? (record.undone ? '<span style="color:#8c8c8c;">已撤回</span>' : '<span style="color:#52c41a;">成功</span>')
+                    : `<span style="color:#ff4d4f;">失败</span>`}
+                </span>
+              </div>
+              <div class="detail-item">
+                <span class="detail-label">备份版本</span>
+                <span class="detail-value">${record.backupVersion || '-'}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="record-detail-section">
+            <h4 style="margin:0 0 8px 0; font-size:14px; color:#262626;">来源备份</h4>
+            <div class="detail-grid">
+              <div class="detail-item">
+                <span class="detail-label">备份导出时间</span>
+                <span class="detail-value">${record.backupExportedAtFormatted || '-'}</span>
+              </div>
+              <div class="detail-item">
+                <span class="detail-label">备份导出人</span>
+                <span class="detail-value">${record.backupExportedBy ? record.backupExportedBy.name + ' (' + record.backupExportedBy.role + ')' : '未知'}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="record-detail-section">
+            <h4 style="margin:0 0 8px 0; font-size:14px; color:#262626;">恢复数据块</h4>
+            <div class="datablock-tags">
+              ${record.dataBlocks ? record.dataBlocks.map(b => `
+                <span class="datablock-tag">${getBlockIcon(b)} ${ExportModule.getDataBlockLabel(b)}</span>
+              `).join('') : '-'}
+            </div>
+          </div>
+
+          ${record.results ? `
+            <div class="record-detail-section">
+              <h4 style="margin:0 0 8px 0; font-size:14px; color:#262626;">实际改动摘要</h4>
+              <p style="font-size:13px; color:#595959; margin-bottom:8px;">${changeSummary || '-'}</p>
+              <div class="result-stats">
+                ${record.results.importedShifts ? `
+                  <div class="result-stat stat-new">
+                    <span class="result-stat-value">${record.results.importedShifts}</span>
+                    <span class="result-stat-label">新增班次</span>
+                  </div>
+                ` : ''}
+                ${record.results.overwrittenShifts ? `
+                  <div class="result-stat stat-overwrite">
+                    <span class="result-stat-value">${record.results.overwrittenShifts}</span>
+                    <span class="result-stat-label">覆盖班次</span>
+                  </div>
+                ` : ''}
+                ${record.results.mergedShifts ? `
+                  <div class="result-stat stat-merge">
+                    <span class="result-stat-value">${record.results.mergedShifts}</span>
+                    <span class="result-stat-label">合并班次</span>
+                  </div>
+                ` : ''}
+                ${record.results.skippedShifts ? `
+                  <div class="result-stat stat-skip">
+                    <span class="result-stat-value">${record.results.skippedShifts}</span>
+                    <span class="result-stat-label">跳过班次</span>
+                  </div>
+                ` : ''}
+                ${record.results.importedDrugs ? `
+                  <div class="result-stat stat-new">
+                    <span class="result-stat-value">${record.results.importedDrugs}</span>
+                    <span class="result-stat-label">新增药品</span>
+                  </div>
+                ` : ''}
+                ${record.results.overwrittenDrugs ? `
+                  <div class="result-stat stat-overwrite">
+                    <span class="result-stat-value">${record.results.overwrittenDrugs}</span>
+                    <span class="result-stat-label">覆盖药品</span>
+                  </div>
+                ` : ''}
+                ${record.results.importedAuditLogs ? `
+                  <div class="result-stat stat-audit">
+                    <span class="result-stat-value">${record.results.importedAuditLogs}</span>
+                    <span class="result-stat-label">导入审计</span>
+                  </div>
+                ` : ''}
+              </div>
+            </div>
+          ` : ''}
+
+          ${record.conflictResolutions && record.conflictResolutions.length > 0 ? `
+            <div class="record-detail-section">
+              <h4 style="margin:0 0 8px 0; font-size:14px; color:#262626;">
+                冲突决策记录 (${record.conflictResolutions.length} 项)
+              </h4>
+              <div class="conflict-resolutions-list">
+                ${record.conflictResolutions.map(cr => `
+                  <div class="conflict-resolution-item">
+                    <span class="cr-type ${cr.type}">${cr.type === 'shift_name_conflict' ? '班次冲突' : cr.type === 'drug_content_conflict' ? '药品冲突' : '修正冲突'}</span>
+                    <span class="cr-target">${cr.target || '-'}</span>
+                    <span class="cr-strategy strategy-${cr.strategy}">${cr.strategy === 'skip' ? '保留本地' : cr.strategy === 'overwrite' ? '覆盖' : '合并'}</span>
+                  </div>
+                `).join('')}
+              </div>
+            </div>
+          ` : ''}
+
+          ${record.undone && record.undoneBy ? `
+            <div class="record-detail-section undone-section">
+              <h4 style="margin:0 0 8px 0; font-size:14px; color:#262626;">撤回信息</h4>
+              <div class="detail-grid">
+                <div class="detail-item">
+                  <span class="detail-label">撤回时间</span>
+                  <span class="detail-value">${record.undoneAtFormatted || '-'}</span>
+                </div>
+                <div class="detail-item">
+                  <span class="detail-label">撤回人</span>
+                  <span class="detail-value">${record.undoneBy.name + ' (' + record.undoneBy.role + ')'}</span>
+                </div>
+              </div>
+            </div>
+          ` : ''}
+
+          ${!record.status === 'failed' && record.errorMessage ? `
+            <div class="record-detail-section error-section">
+              <h4 style="margin:0 0 8px 0; font-size:14px; color:#ff4d4f;">错误信息</h4>
+              <p style="font-size:13px; color:#ff4d4f;">${record.errorMessage}</p>
+            </div>
+          ` : ''}
+
+          <div class="modal-actions">
+            <button class="btn btn-default" onclick="App.closeRestoreRecordDetail()">关闭</button>
+            ${record.status === 'success' && !record.undone && Auth.canUndoRestore() ? `
+              <button class="btn btn-warning" onclick="App.handleUndoRestore(); App.closeRestoreRecordDetail();">
+                撤回此恢复
+              </button>
+            ` : ''}
+          </div>
+        </div>
+      </div>
+    `;
+
+    renderRestoreRecordsView(document.getElementById('backup-subtab-content'));
+  }
+
+  function closeRestoreRecordDetail() {
+    const modal = document.getElementById('restore-record-detail-modal');
+    if (modal) modal.innerHTML = '';
+    selectedRestoreRecordId = null;
+    renderRestoreRecordsView(document.getElementById('backup-subtab-content'));
   }
 
   function renderBackupSettings(container) {
@@ -2149,7 +3043,14 @@ const App = (function() {
     handleImportBackupFile,
     saveBackupSetting,
     runCleanupNow,
-    clearAllBackups
+    clearAllBackups,
+    switchRestoreConsoleTab,
+    refreshRestoreConsole,
+    setConflictStrategy,
+    setGroupStrategy,
+    setAllConflictStrategy,
+    viewRestoreRecordDetail,
+    closeRestoreRecordDetail
   };
 })();
 
