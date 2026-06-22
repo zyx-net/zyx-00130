@@ -9,11 +9,14 @@ const App = (function() {
     startDate: '',
     endDate: ''
   };
+  let restoreDraftFilters = { keyword: '', status: '' };
+  let restoreRecordFilters = { keyword: '', operatorName: '', dataBlock: '', undone: '', startDate: '', endDate: '' };
   let selectedBackupId = null;
   let selectedDataBlocks = [];
   let backupPendingPreview = null;
   let backupPendingConflicts = null;
   let backupPendingResolutions = [];
+  let backupStrategyReuseInfo = null;
 
   function init() {
     Storage.initializeDemoData();
@@ -805,6 +808,10 @@ const App = (function() {
                onclick="App.switchBackupSubTab('records')">
             📋 恢复记录
           </div>
+          <div class="backup-subtab ${backupSubTab === 'drafts' ? 'active' : ''}"
+               onclick="App.switchBackupSubTab('drafts')">
+            📝 恢复草案
+          </div>
           ${isPharmacist ? `
             <div class="backup-subtab ${backupSubTab === 'settings' ? 'active' : ''}"
                  onclick="App.switchBackupSubTab('settings')">
@@ -823,6 +830,9 @@ const App = (function() {
         break;
       case 'records':
         renderRestoreRecordsView(subContent);
+        break;
+      case 'drafts':
+        renderRestoreDraftsView(subContent);
         break;
       case 'settings':
         renderBackupSettings(subContent);
@@ -1026,6 +1036,10 @@ const App = (function() {
     if (!backupPendingConflicts) {
       const conflicts = ExportModule.detectConflicts(backupInfo.backupData);
       backupPendingConflicts = conflicts;
+      const strategyReuse = ExportModule.checkConflictStrategyReuse(conflicts);
+      if (strategyReuse.hasMatches) {
+        backupStrategyReuseInfo = strategyReuse;
+      }
     }
 
     const conflictGroups = ExportModule.getConflictsGrouped(backupInfo.backupData);
@@ -1060,6 +1074,14 @@ const App = (function() {
               <button class="btn btn-default btn-sm" onclick="App.closeBackupDetail()">关闭</button>
             </div>
           </div>
+
+          ${backupStrategyReuseInfo && backupStrategyReuseInfo.hasMatches ? `
+            <div class="alert alert-info" style="margin:8px 0 0 0; display:flex; align-items:center; gap:8px;">
+              <span>💡 检测到 ${backupStrategyReuseInfo.matchedCount} 项冲突曾处理过，是否沿用上次策略？</span>
+              <button class="btn btn-primary btn-sm" onclick="App.applyReuseStrategies()">沿用旧决定</button>
+              <button class="btn btn-default btn-sm" onclick="App.dismissReusePrompt()">手动选择</button>
+            </div>
+          ` : ''}
 
           ${backupInfo.note ? `
             <div class="restore-note-bar">
@@ -1779,7 +1801,23 @@ const App = (function() {
     selectedBackupId = null;
     selectedDataBlocks = [];
     backupPendingPreview = null;
+    backupStrategyReuseInfo = null;
     renderBackupHistory(document.getElementById('backup-subtab-content'));
+  }
+
+  function applyReuseStrategies() {
+    if (!backupPendingConflicts) return;
+    const result = ExportModule.applyConflictStrategyReuse(backupPendingConflicts, true);
+    if (result.success && result.resolutions) {
+      backupPendingResolutions = result.resolutions;
+    }
+    backupStrategyReuseInfo = null;
+    viewBackupDetail(selectedBackupId);
+  }
+
+  function dismissReusePrompt() {
+    backupStrategyReuseInfo = null;
+    viewBackupDetail(selectedBackupId);
   }
 
   function toggleDataBlock(block, checked) {
@@ -2154,12 +2192,396 @@ const App = (function() {
     reader.readAsText(file, 'UTF-8');
   }
 
+  function renderRestoreDraftsView(container) {
+    const result = ExportModule.listRestoreDrafts(restoreDraftFilters);
+    const drafts = result.success ? result.drafts : [];
+    const isPharmacist = Auth.isPharmacist();
+
+    container.innerHTML = `
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+          <h3 style="margin:0;">恢复草案 <span style="font-size:12px; color:#8c8c8c;">(${drafts.length})</span></h3>
+          <div style="display:flex; gap:8px;">
+            ${isPharmacist ? `
+              <button class="btn btn-primary btn-sm" onclick="App.showCreateDraftModal()">+ 创建草案</button>
+              <button class="btn btn-default btn-sm" onclick="App.showCreateDraftFromBackup()">📥 从备份创建</button>
+            ` : ''}
+          </div>
+        </div>
+
+        <div class="backup-filter-bar">
+          <input type="text" class="backup-filter-input"
+                 placeholder="🔍 搜索草案名称、备注、创建人..."
+                 value="${restoreDraftFilters.keyword}"
+                 oninput="App.filterRestoreDraftsUI('keyword', this.value)">
+          <select class="backup-filter-select" onchange="App.filterRestoreDraftsUI('status', this.value)">
+            <option value="">全部状态</option>
+            <option value="draft" ${restoreDraftFilters.status === 'draft' ? 'selected' : ''}>草稿中</option>
+            <option value="executed" ${restoreDraftFilters.status === 'executed' ? 'selected' : ''}>已执行</option>
+            <option value="undone" ${restoreDraftFilters.status === 'undone' ? 'selected' : ''}>已撤回</option>
+          </select>
+          <button class="btn btn-default btn-sm" onclick="App.clearRestoreDraftFilters()">重置</button>
+        </div>
+
+        <p style="font-size:12px; color:#8c8c8c; margin:12px 0;">
+          共 ${drafts.length} 条草案
+        </p>
+
+        ${drafts.length === 0 ? `
+          <div class="empty-state">暂无恢复草案</div>
+        ` : `
+          <div class="restore-records-list">
+            ${drafts.map(d => renderRestoreDraftCard(d)).join('')}
+          </div>
+        `}
+      </div>
+
+      <div id="restore-draft-detail-modal"></div>
+    `;
+  }
+
+  function renderRestoreDraftCard(draft) {
+    const isPharmacist = Auth.isPharmacist();
+    let statusBadge = '';
+    if (draft.status === 'draft') {
+      statusBadge = '<span style="background:#fffbe6; color:#faad14; border:1px solid #ffe58f; padding:2px 8px; border-radius:10px; font-size:11px;">草稿中</span>';
+    } else if (draft.status === 'executed') {
+      statusBadge = '<span style="background:#f6ffed; color:#52c41a; border:1px solid #b7eb8f; padding:2px 8px; border-radius:10px; font-size:11px;">已执行</span>';
+    } else if (draft.status === 'undone') {
+      statusBadge = '<span style="background:#fafafa; color:#8c8c8c; border:1px solid #d9d9d9; padding:2px 8px; border-radius:10px; font-size:11px;">已撤回</span>';
+    }
+
+    const allBlocks = ExportModule.getAllDataBlocks();
+    const blockTags = (draft.dataBlocks || []).map(b => {
+      return `<span style="display:inline-block; background:#f0f0f0; border-radius:3px; padding:1px 6px; font-size:11px; margin:2px 2px;">${getBlockIcon(b)} ${ExportModule.getDataBlockLabel(b)}</span>`;
+    }).join('');
+
+    let actionsHtml = '';
+    if (draft.status === 'draft' && isPharmacist) {
+      actionsHtml = `
+        <div style="margin-top:8px; display:flex; gap:6px;">
+          <button class="btn btn-default btn-sm" onclick="event.stopPropagation(); App.showEditDraftModal('${draft.id}')">编辑</button>
+          <button class="btn btn-danger btn-sm" onclick="event.stopPropagation(); App.handleDeleteDraft('${draft.id}')">删除</button>
+          <button class="btn btn-success btn-sm" onclick="event.stopPropagation(); App.handleSubmitDraft('${draft.id}')">提交执行</button>
+        </div>
+      `;
+    }
+    if (draft.status === 'executed' && draft.restoreRecordId) {
+      actionsHtml = `
+        <div style="margin-top:8px;">
+          <button class="btn btn-default btn-sm" onclick="event.stopPropagation(); App.viewRestoreRecordDetail('${draft.restoreRecordId}')">查看恢复记录</button>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="restore-record-card" style="cursor:default;">
+        <div class="record-card-header">
+          <div class="record-card-title">
+            ${statusBadge}
+            <span style="margin-left:8px; font-weight:500;">${draft.name || '未命名草案'}</span>
+          </div>
+          <div class="record-card-meta">
+            <span class="record-time">${draft.createdAtFormatted || '-'}</span>
+            <span class="record-operator">${draft.createdBy ? draft.createdBy.name : '未知'}</span>
+          </div>
+        </div>
+        <div class="record-card-body">
+          <div style="margin-bottom:6px;">${blockTags}</div>
+          ${draft.conflictResolutions && draft.conflictResolutions.length > 0 ? `
+            <span style="font-size:11px; color:#faad14;">冲突策略 ${draft.conflictResolutions.length} 项</span>
+          ` : ''}
+          ${draft.note ? `<p style="font-size:12px; color:#8c8c8c; margin-top:4px;">📝 ${draft.note}</p>` : ''}
+          ${actionsHtml}
+        </div>
+      </div>
+    `;
+  }
+
+  function showCreateDraftModal() {
+    if (!Auth.canCreateRestoreDraft()) {
+      alert('只有药师可以创建恢复草案');
+      return;
+    }
+
+    const allBlocks = ExportModule.getAllDataBlocks();
+    const backupHistory = Storage.getBackupHistory();
+
+    const modal = document.createElement('div');
+    modal.className = 'modal-overlay';
+    modal.id = 'create-draft-modal';
+    modal.innerHTML = `
+      <div class="modal">
+        <h3>创建恢复草案</h3>
+        <div class="form-group">
+          <label>草案名称</label>
+          <input type="text" id="draft-name-input" placeholder="例如：早班恢复方案">
+        </div>
+        <div class="form-group">
+          <label>备注（可选）</label>
+          <textarea id="draft-note-input" rows="3" placeholder="记录草案说明"></textarea>
+        </div>
+        <div class="form-group">
+          <label>数据块选择</label>
+          <div style="display:flex; flex-wrap:wrap; gap:8px;">
+            ${allBlocks.map(b => `
+              <label style="font-size:13px; cursor:pointer;">
+                <input type="checkbox" class="draft-block-checkbox" value="${b}" checked>
+                ${getBlockIcon(b)} ${ExportModule.getDataBlockLabel(b)}
+              </label>
+            `).join('')}
+          </div>
+        </div>
+        <div class="form-group">
+          <label>关联备份（可选）</label>
+          <select id="draft-backup-select" style="width:100%;">
+            <option value="">不关联备份</option>
+            ${backupHistory.map(b => `
+              <option value="${b.id}">${b.name || '未命名'} (${b.createdAtFormatted})</option>
+            `).join('')}
+          </select>
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-default" onclick="document.getElementById('create-draft-modal').remove()">取消</button>
+          <button class="btn btn-primary" onclick="App.handleCreateDraft()">保存草案</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+  }
+
+  function showCreateDraftFromBackup() {
+    if (!Auth.canCreateRestoreDraft()) {
+      alert('只有药师可以创建恢复草案');
+      return;
+    }
+    showCreateDraftModal();
+  }
+
+  function handleCreateDraft() {
+    const name = document.getElementById('draft-name-input').value.trim();
+    const note = document.getElementById('draft-note-input').value.trim();
+    const checkboxes = document.querySelectorAll('.draft-block-checkbox');
+    const dataBlocks = [];
+    checkboxes.forEach(cb => { if (cb.checked) dataBlocks.push(cb.value); });
+
+    const backupSelect = document.getElementById('draft-backup-select');
+    const backupId = backupSelect ? backupSelect.value : '';
+    let backupInfo = null;
+    if (backupId) {
+      const bi = Storage.getBackupById(backupId);
+      if (bi) {
+        backupInfo = {
+          id: bi.id,
+          version: bi.version,
+          exportedAt: bi.exportedAt,
+          exportedAtFormatted: bi.exportedAtFormatted,
+          exportedBy: bi.createdBy || null,
+          summary: bi.summary || null,
+          backupId: bi.id
+        };
+      }
+    }
+
+    const result = ExportModule.createRestoreDraft({
+      name: name,
+      note: note,
+      dataBlocks: dataBlocks,
+      conflictResolutions: [],
+      backupInfo: backupInfo
+    });
+
+    if (result.success) {
+      document.getElementById('create-draft-modal').remove();
+      renderRestoreDraftsView(document.getElementById('backup-subtab-content'));
+    } else {
+      alert('创建失败：' + result.message);
+    }
+  }
+
+  function showEditDraftModal(draftId) {
+    if (!Auth.canEditRestoreDraft()) {
+      alert('只有药师可以编辑恢复草案');
+      return;
+    }
+
+    const result = ExportModule.getRestoreDraft(draftId);
+    if (!result.success) {
+      alert(result.message);
+      return;
+    }
+    const draft = result.draft;
+    const allBlocks = ExportModule.getAllDataBlocks();
+    const backupHistory = Storage.getBackupHistory();
+
+    const modal = document.createElement('div');
+    modal.className = 'modal-overlay';
+    modal.id = 'edit-draft-modal';
+    modal.innerHTML = `
+      <div class="modal">
+        <h3>编辑恢复草案</h3>
+        <div class="form-group">
+          <label>草案名称</label>
+          <input type="text" id="edit-draft-name" value="${draft.name || ''}">
+        </div>
+        <div class="form-group">
+          <label>备注</label>
+          <textarea id="edit-draft-note" rows="3">${draft.note || ''}</textarea>
+        </div>
+        <div class="form-group">
+          <label>数据块选择</label>
+          <div style="display:flex; flex-wrap:wrap; gap:8px;">
+            ${allBlocks.map(b => `
+              <label style="font-size:13px; cursor:pointer;">
+                <input type="checkbox" class="edit-draft-block-checkbox" value="${b}" ${draft.dataBlocks && draft.dataBlocks.includes(b) ? 'checked' : ''}>
+                ${getBlockIcon(b)} ${ExportModule.getDataBlockLabel(b)}
+              </label>
+            `).join('')}
+          </div>
+        </div>
+        <div class="form-group">
+          <label>关联备份</label>
+          <select id="edit-draft-backup-select" style="width:100%;">
+            <option value="">不关联备份</option>
+            ${backupHistory.map(b => `
+              <option value="${b.id}" ${draft.backupInfo && draft.backupInfo.backupId === b.id ? 'selected' : ''}>${b.name || '未命名'} (${b.createdAtFormatted})</option>
+            `).join('')}
+          </select>
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-default" onclick="document.getElementById('edit-draft-modal').remove()">取消</button>
+          <button class="btn btn-primary" onclick="App.handleUpdateDraft('${draftId}')">保存</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+  }
+
+  function handleUpdateDraft(draftId) {
+    const name = document.getElementById('edit-draft-name').value.trim();
+    const note = document.getElementById('edit-draft-note').value.trim();
+    const checkboxes = document.querySelectorAll('.edit-draft-block-checkbox');
+    const dataBlocks = [];
+    checkboxes.forEach(cb => { if (cb.checked) dataBlocks.push(cb.value); });
+
+    const backupSelect = document.getElementById('edit-draft-backup-select');
+    const backupId = backupSelect ? backupSelect.value : '';
+    let backupInfo = null;
+    if (backupId) {
+      const bi = Storage.getBackupById(backupId);
+      if (bi) {
+        backupInfo = {
+          id: bi.id,
+          version: bi.version,
+          exportedAt: bi.exportedAt,
+          exportedAtFormatted: bi.exportedAtFormatted,
+          exportedBy: bi.createdBy || null,
+          summary: bi.summary || null,
+          backupId: bi.id
+        };
+      }
+    }
+
+    const result = ExportModule.updateRestoreDraft(draftId, {
+      name: name,
+      note: note,
+      dataBlocks: dataBlocks,
+      conflictResolutions: [],
+      backupInfo: backupInfo
+    });
+
+    if (result.success) {
+      document.getElementById('edit-draft-modal').remove();
+      renderRestoreDraftsView(document.getElementById('backup-subtab-content'));
+    } else {
+      alert('更新失败：' + result.message);
+    }
+  }
+
+  function handleDeleteDraft(draftId) {
+    if (!confirm('确认删除此恢复草案？此操作不可恢复。')) {
+      return;
+    }
+    const result = ExportModule.deleteRestoreDraft(draftId);
+    if (result.success) {
+      renderRestoreDraftsView(document.getElementById('backup-subtab-content'));
+    } else {
+      alert('删除失败：' + result.message);
+    }
+  }
+
+  function handleSubmitDraft(draftId) {
+    if (!Auth.isPharmacist()) {
+      alert('只有药师可以提交恢复草案');
+      return;
+    }
+
+    const draftResult = ExportModule.getRestoreDraft(draftId);
+    if (!draftResult.success) {
+      alert(draftResult.message);
+      return;
+    }
+    const draft = draftResult.draft;
+
+    let confirmMsg = `确认提交并执行恢复草案？\n\n草案名称：${draft.name || '未命名'}\n数据块：${(draft.dataBlocks || []).map(b => ExportModule.getDataBlockLabel(b)).join('、')}\n`;
+    if (draft.conflictResolutions && draft.conflictResolutions.length > 0) {
+      confirmMsg += `冲突策略：${draft.conflictResolutions.length} 项\n`;
+    }
+    confirmMsg += '\n执行后数据将被修改，确认继续？';
+    if (!confirm(confirmMsg)) {
+      return;
+    }
+
+    let backupData = null;
+    if (draft.backupInfo && draft.backupInfo.backupId) {
+      const backupInfo = Storage.getBackupById(draft.backupInfo.backupId);
+      if (backupInfo && backupInfo.backupData) {
+        backupData = backupInfo.backupData;
+      }
+    }
+
+    if (!backupData) {
+      alert('无法获取关联的备份数据，请先编辑草案关联一个有效备份。');
+      return;
+    }
+
+    const result = ExportModule.submitRestoreDraft(draftId, backupData);
+    if (result.success) {
+      alert('✅ 恢复草案已执行成功！\n恢复记录ID: ' + (result.restoreRecordId || ''));
+      renderRestoreDraftsView(document.getElementById('backup-subtab-content'));
+    } else {
+      alert('执行失败：' + result.message);
+    }
+  }
+
+  function filterRestoreDraftsUI(key, value) {
+    restoreDraftFilters[key] = value;
+    renderRestoreDraftsView(document.getElementById('backup-subtab-content'));
+  }
+
+  function clearRestoreDraftFilters() {
+    restoreDraftFilters = { keyword: '', status: '' };
+    renderRestoreDraftsView(document.getElementById('backup-subtab-content'));
+  }
+
   let selectedRestoreRecordId = null;
 
   function renderRestoreRecordsView(container) {
-    const records = ExportModule.getRestoreRecords();
+    const filterResult = ExportModule.filterRestoreRecords(restoreRecordFilters);
+    const records = filterResult.success ? filterResult.records : [];
+    const allRecords = ExportModule.getRestoreRecords();
     const lastInfo = ExportModule.getLastRestoreInfo();
     const canUndo = lastInfo && lastInfo.hasUndoableSnapshot && Auth.canUndoRestore();
+    const allBlocks = ExportModule.getAllDataBlocks();
+
+    const operatorNames = [];
+    const nameSet = new Set();
+    allRecords.forEach(r => {
+      if (r.restoredBy && r.restoredBy.name && !nameSet.has(r.restoredBy.name)) {
+        nameSet.add(r.restoredBy.name);
+        operatorNames.push(r.restoredBy.name);
+      }
+    });
 
     container.innerHTML = `
       <div class="card">
@@ -2174,6 +2596,41 @@ const App = (function() {
             ` : ''}
           </div>
         </div>
+
+        <div class="backup-filter-bar">
+          <input type="text" class="backup-filter-input"
+                 placeholder="🔍 搜索操作人、备份导出人..."
+                 value="${restoreRecordFilters.keyword}"
+                 oninput="App.filterRestoreRecordsUI('keyword', this.value)">
+          <select class="backup-filter-select" onchange="App.filterRestoreRecordsUI('operatorName', this.value)">
+            <option value="">全部操作人</option>
+            ${operatorNames.map(n => `
+              <option value="${n}" ${restoreRecordFilters.operatorName === n ? 'selected' : ''}>${n}</option>
+            `).join('')}
+          </select>
+          <select class="backup-filter-select" onchange="App.filterRestoreRecordsUI('dataBlock', this.value)">
+            <option value="">全部数据块</option>
+            ${allBlocks.map(b => `
+              <option value="${b}" ${restoreRecordFilters.dataBlock === b ? 'selected' : ''}>${ExportModule.getDataBlockLabel(b)}</option>
+            `).join('')}
+          </select>
+          <select class="backup-filter-select" onchange="App.filterRestoreRecordsUI('undone', this.value)">
+            <option value="">全部状态</option>
+            <option value="false" ${restoreRecordFilters.undone === 'false' ? 'selected' : ''}>未撤回</option>
+            <option value="true" ${restoreRecordFilters.undone === 'true' ? 'selected' : ''}>已撤回</option>
+          </select>
+          <input type="date" class="backup-filter-input"
+                 value="${restoreRecordFilters.startDate}"
+                 onchange="App.filterRestoreRecordsUI('startDate', this.value)">
+          <input type="date" class="backup-filter-input"
+                 value="${restoreRecordFilters.endDate}"
+                 onchange="App.filterRestoreRecordsUI('endDate', this.value)">
+          <button class="btn btn-default btn-sm" onclick="App.clearRestoreRecordFilters()">重置</button>
+        </div>
+
+        <p style="font-size:12px; color:#8c8c8c; margin:12px 0;">
+          筛选结果：${records.length} / ${allRecords.length} 条记录
+        </p>
 
         ${records.length === 0 ? `
           <div class="empty-state">暂无恢复操作记录</div>
@@ -2248,14 +2705,125 @@ const App = (function() {
 
   function viewRestoreRecordDetail(recordId) {
     selectedRestoreRecordId = recordId;
-    const detail = ExportModule.getRestoreRecordDetail(recordId);
-    if (!detail) {
+    const detailResult = ExportModule.getRestoreRecordWithChanges(recordId);
+    if (!detailResult || !detailResult.success) {
       alert('恢复记录不存在');
       return;
     }
 
-    const record = detail.record;
+    const record = detailResult.record;
+    const changes = detailResult.changes;
     const changeSummary = ExportModule.buildRestoreChangeSummary(record);
+
+    let changeCompareHtml = '';
+    if (changes) {
+      changeCompareHtml = `
+        <div class="record-detail-section">
+          <h4 style="margin:0 0 8px 0; font-size:14px; color:#262626;">变更对比</h4>
+          <div style="display:flex; flex-wrap:wrap; gap:8px; font-size:12px;">
+            ${changes.shifts ? `
+              <div style="background:#f6ffed; padding:6px 10px; border-radius:4px; border:1px solid #b7eb8f;">
+                <strong>班次：</strong>
+                新增 ${changes.shifts.imported || 0} /
+                覆盖 ${changes.shifts.overwritten || 0} /
+                合并 ${changes.shifts.merged || 0} /
+                跳过 ${changes.shifts.skipped || 0}
+              </div>
+            ` : ''}
+            ${changes.drugs ? `
+              <div style="background:#e6f7ff; padding:6px 10px; border-radius:4px; border:1px solid #91d5ff;">
+                <strong>药品：</strong>
+                新增/导入 ${changes.drugs.imported || 0} /
+                覆盖 ${changes.drugs.overwritten || 0} /
+                合并 ${changes.drugs.merged || 0}
+              </div>
+            ` : ''}
+            ${changes.corrections ? `
+              <div style="background:#fffbe6; padding:6px 10px; border-radius:4px; border:1px solid #ffe58f;">
+                <strong>修正：</strong>
+                覆盖 ${changes.corrections.overwritten || 0} /
+                合并 ${changes.corrections.merged || 0}
+              </div>
+            ` : ''}
+            ${changes.auditLogs ? `
+              <div style="background:#f9f0ff; padding:6px 10px; border-radius:4px; border:1px solid #d3adf7;">
+                <strong>审计日志：</strong>
+                导入 ${changes.auditLogs.imported || 0}
+              </div>
+            ` : ''}
+          </div>
+        </div>
+      `;
+    }
+
+    let draftInfoHtml = '';
+    if (detailResult.draftInfo) {
+      draftInfoHtml = `
+        <div class="record-detail-section">
+          <h4 style="margin:0 0 8px 0; font-size:14px; color:#262626;">草案信息</h4>
+          <div class="detail-grid">
+            <div class="detail-item">
+              <span class="detail-label">草案ID</span>
+              <span class="detail-value">${detailResult.draftInfo.draftId || '-'}</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">草案名称</span>
+              <span class="detail-value">${detailResult.draftInfo.draftName || '-'}</span>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    let auditTrailHtml = '';
+    const auditLogs = Storage.getAuditLogs();
+    const relatedLogs = auditLogs.filter(l => {
+      if (l.details && l.details.includes(record.id)) return true;
+      if (l.action && (l.action.includes('恢复') || l.action.includes('撤回')) && l.timestamp) {
+        const logTime = new Date(l.timestamp).getTime();
+        const recordTime = new Date(record.timestamp).getTime();
+        return Math.abs(logTime - recordTime) < 60000;
+      }
+      return false;
+    });
+    if (relatedLogs.length > 0) {
+      auditTrailHtml = `
+        <div class="record-detail-section">
+          <h4 style="margin:0 0 8px 0; font-size:14px; color:#262626;">审计追踪</h4>
+          <div style="font-size:12px;">
+            ${relatedLogs.slice(0, 10).map(l => `
+              <div style="padding:4px 0; border-bottom:1px solid #f0f0f0;">
+                <span style="color:#8c8c8c;">${l.timestampFormatted}</span>
+                <span style="margin:0 6px;">${l.userName || '系统'}</span>
+                <span style="color:#595959;">${l.action}：${l.details}</span>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      `;
+    }
+
+    let undoWarningHtml = '';
+    if (record.undone && record.undoneBy) {
+      undoWarningHtml = `
+        <div class="record-detail-section undone-section">
+          <h4 style="margin:0 0 8px 0; font-size:14px; color:#262626;">撤回信息</h4>
+          <div class="detail-grid">
+            <div class="detail-item">
+              <span class="detail-label">撤回时间</span>
+              <span class="detail-value">${record.undoneAtFormatted || '-'}</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">撤回人</span>
+              <span class="detail-value">${record.undoneBy.name + ' (' + record.undoneBy.role + ')'}</span>
+            </div>
+          </div>
+          <div class="alert alert-error" style="margin-top:8px; font-size:12px;">
+            ⚠️ <strong>不可二次撤回</strong>：该恢复已被撤回，无法再次撤回。
+          </div>
+        </div>
+      `;
+    }
 
     const modal = document.getElementById('restore-record-detail-modal');
     modal.innerHTML = `
@@ -2322,6 +2890,8 @@ const App = (function() {
               `).join('') : '-'}
             </div>
           </div>
+
+          ${changeCompareHtml}
 
           ${record.results ? `
             <div class="record-detail-section">
@@ -2391,21 +2961,9 @@ const App = (function() {
             </div>
           ` : ''}
 
-          ${record.undone && record.undoneBy ? `
-            <div class="record-detail-section undone-section">
-              <h4 style="margin:0 0 8px 0; font-size:14px; color:#262626;">撤回信息</h4>
-              <div class="detail-grid">
-                <div class="detail-item">
-                  <span class="detail-label">撤回时间</span>
-                  <span class="detail-value">${record.undoneAtFormatted || '-'}</span>
-                </div>
-                <div class="detail-item">
-                  <span class="detail-label">撤回人</span>
-                  <span class="detail-value">${record.undoneBy.name + ' (' + record.undoneBy.role + ')'}</span>
-                </div>
-              </div>
-            </div>
-          ` : ''}
+          ${draftInfoHtml}
+          ${auditTrailHtml}
+          ${undoWarningHtml}
 
           ${!record.status === 'failed' && record.errorMessage ? `
             <div class="record-detail-section error-section">
@@ -2433,6 +2991,24 @@ const App = (function() {
     const modal = document.getElementById('restore-record-detail-modal');
     if (modal) modal.innerHTML = '';
     selectedRestoreRecordId = null;
+    renderRestoreRecordsView(document.getElementById('backup-subtab-content'));
+  }
+
+  function filterRestoreRecordsUI(key, value) {
+    if (key === 'undone') {
+      if (value === '') {
+        delete restoreRecordFilters.undone;
+      } else {
+        restoreRecordFilters.undone = value === 'true';
+      }
+    } else {
+      restoreRecordFilters[key] = value;
+    }
+    renderRestoreRecordsView(document.getElementById('backup-subtab-content'));
+  }
+
+  function clearRestoreRecordFilters() {
+    restoreRecordFilters = { keyword: '', operatorName: '', dataBlock: '', undone: '', startDate: '', endDate: '' };
     renderRestoreRecordsView(document.getElementById('backup-subtab-content'));
   }
 
@@ -3050,7 +3626,22 @@ const App = (function() {
     setGroupStrategy,
     setAllConflictStrategy,
     viewRestoreRecordDetail,
-    closeRestoreRecordDetail
+    closeRestoreRecordDetail,
+    renderRestoreDraftsView,
+    renderRestoreDraftCard,
+    showCreateDraftModal,
+    showCreateDraftFromBackup,
+    handleCreateDraft,
+    showEditDraftModal,
+    handleUpdateDraft,
+    handleDeleteDraft,
+    handleSubmitDraft,
+    filterRestoreDraftsUI,
+    clearRestoreDraftFilters,
+    filterRestoreRecordsUI,
+    clearRestoreRecordFilters,
+    applyReuseStrategies,
+    dismissReusePrompt
   };
 })();
 
