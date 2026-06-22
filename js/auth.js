@@ -93,6 +93,32 @@ const Auth = (function() {
     return isPharmacist();
   }
 
+  function canCreateRestoreDraft() {
+    return isPharmacist();
+  }
+
+  function canEditRestoreDraft(draft) {
+    if (!isPharmacist()) return false;
+    const user = getCurrentUser();
+    if (!user) return false;
+    if (!draft) return true;
+    if (draft.status !== 'draft') return false;
+    return true;
+  }
+
+  function canSubmitRestoreDraft() {
+    return isPharmacist();
+  }
+
+  function canDeleteRestoreDraft() {
+    return isPharmacist();
+  }
+
+  function canViewRestoreDrafts() {
+    const user = getCurrentUser();
+    return !!(user && (user.role === 'pharmacist' || user.role === 'nurse'));
+  }
+
   return {
     login,
     logout,
@@ -109,6 +135,11 @@ const Auth = (function() {
     canPerformRestore,
     canPerformPartialRestore,
     canViewRestoreRecords,
-    canManageBackups
+    canManageBackups,
+    canCreateRestoreDraft,
+    canEditRestoreDraft,
+    canSubmitRestoreDraft,
+    canDeleteRestoreDraft,
+    canViewRestoreDrafts
   };
 })();

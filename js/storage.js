@@ -15,7 +15,9 @@ const Storage = (function() {
     LAST_RESTORE_SNAPSHOT: PREFIX + 'last_restore_snapshot',
     BACKUP_HISTORY: PREFIX + 'backup_history',
     RESTORE_LOCK: PREFIX + 'restore_lock',
-    BACKUP_SETTINGS: PREFIX + 'backup_settings'
+    BACKUP_SETTINGS: PREFIX + 'backup_settings',
+    RESTORE_DRAFTS: PREFIX + 'restore_drafts',
+    CONFLICT_STRATEGY_HISTORY: PREFIX + 'conflict_strategy_history'
   };
 
   function get(key, defaultValue = null) {
@@ -765,6 +767,201 @@ const Storage = (function() {
     return history;
   }
 
+  function getRestoreDrafts() {
+    return get(KEYS.RESTORE_DRAFTS, []);
+  }
+
+  function saveRestoreDrafts(drafts) {
+    return set(KEYS.RESTORE_DRAFTS, drafts);
+  }
+
+  function getRestoreDraftById(draftId) {
+    const drafts = getRestoreDrafts();
+    return drafts.find(d => d.id === draftId) || null;
+  }
+
+  function addRestoreDraft(draft) {
+    const drafts = getRestoreDrafts();
+    const fullDraft = {
+      id: generateId('draft'),
+      createdAt: new Date().toISOString(),
+      createdAtFormatted: formatDateTime(new Date()),
+      updatedAt: new Date().toISOString(),
+      updatedAtFormatted: formatDateTime(new Date()),
+      status: 'draft',
+      ...draft
+    };
+    drafts.unshift(fullDraft);
+    saveRestoreDrafts(drafts);
+    return fullDraft;
+  }
+
+  function updateRestoreDraft(draftId, updates) {
+    const drafts = getRestoreDrafts();
+    const idx = drafts.findIndex(d => d.id === draftId);
+    if (idx >= 0) {
+      drafts[idx] = {
+        ...drafts[idx],
+        ...updates,
+        updatedAt: new Date().toISOString(),
+        updatedAtFormatted: formatDateTime(new Date())
+      };
+      saveRestoreDrafts(drafts);
+      return drafts[idx];
+    }
+    return null;
+  }
+
+  function deleteRestoreDraft(draftId) {
+    const drafts = getRestoreDrafts();
+    const filtered = drafts.filter(d => d.id !== draftId);
+    saveRestoreDrafts(filtered);
+    return filtered.length !== drafts.length;
+  }
+
+  function filterRestoreDrafts(filters) {
+    let drafts = getRestoreDrafts();
+
+    if (filters) {
+      if (filters.keyword) {
+        const kw = filters.keyword.toLowerCase();
+        drafts = drafts.filter(d =>
+          (d.name && d.name.toLowerCase().includes(kw)) ||
+          (d.note && d.note.toLowerCase().includes(kw)) ||
+          (d.createdBy && d.createdBy.name && d.createdBy.name.toLowerCase().includes(kw))
+        );
+      }
+
+      if (filters.status) {
+        drafts = drafts.filter(d => d.status === filters.status);
+      }
+
+      if (filters.createdByUserId) {
+        drafts = drafts.filter(d => d.createdBy && d.createdBy.id === filters.createdByUserId);
+      }
+
+      if (filters.startDate) {
+        const start = new Date(filters.startDate).getTime();
+        drafts = drafts.filter(d => new Date(d.createdAt).getTime() >= start);
+      }
+
+      if (filters.endDate) {
+        const end = new Date(filters.endDate).getTime() + 24 * 60 * 60 * 1000;
+        drafts = drafts.filter(d => new Date(d.createdAt).getTime() < end);
+      }
+
+      if (filters.dataBlock) {
+        drafts = drafts.filter(d =>
+          d.dataBlocks && d.dataBlocks.includes(filters.dataBlock)
+        );
+      }
+    }
+
+    return drafts;
+  }
+
+  function getConflictStrategyHistory() {
+    return get(KEYS.CONFLICT_STRATEGY_HISTORY, []);
+  }
+
+  function saveConflictStrategyHistory(history) {
+    return set(KEYS.CONFLICT_STRATEGY_HISTORY, history);
+  }
+
+  function addConflictStrategy(strategyEntry) {
+    const history = getConflictStrategyHistory();
+    const fullEntry = {
+      id: generateId('strategy'),
+      createdAt: new Date().toISOString(),
+      createdAtFormatted: formatDateTime(new Date()),
+      ...strategyEntry
+    };
+    history.unshift(fullEntry);
+    saveConflictStrategyHistory(history);
+    return fullEntry;
+  }
+
+  function findMatchingConflictStrategy(conflict) {
+    const history = getConflictStrategyHistory();
+    const conflictKey = generateConflictKey(conflict);
+    return history.find(h => h.conflictKey === conflictKey) || null;
+  }
+
+  function generateConflictKey(conflict) {
+    if (!conflict) return '';
+    switch (conflict.type) {
+      case 'shift_name_conflict':
+        return `shift|${conflict.importedName || ''}`;
+      case 'duplicate_correction':
+        return `correction|${conflict.importedDiscrepancyDrug || ''}|${conflict.correction?.requestedAt || ''}|${conflict.correction?.requestedBy || ''}`;
+      case 'drug_content_conflict':
+        return `drug|${conflict.drugCode || ''}`;
+      default:
+        return `other|${JSON.stringify(conflict).substring(0, 100)}`;
+    }
+  }
+
+  function filterRestoreRecords(filters) {
+    let records = getRestoreRecords();
+
+    if (filters) {
+      if (filters.keyword) {
+        const kw = filters.keyword.toLowerCase();
+        records = records.filter(r =>
+          (r.backupExportedBy && r.backupExportedBy.name && r.backupExportedBy.name.toLowerCase().includes(kw)) ||
+          (r.restoredBy && r.restoredBy.name && r.restoredBy.name.toLowerCase().includes(kw)) ||
+          (r.errorMessage && r.errorMessage.toLowerCase().includes(kw))
+        );
+      }
+
+      if (filters.status) {
+        records = records.filter(r => r.status === filters.status);
+      }
+
+      if (filters.operatorName) {
+        records = records.filter(r =>
+          r.restoredBy && r.restoredBy.name === filters.operatorName
+        );
+      }
+
+      if (filters.operatorRole) {
+        records = records.filter(r =>
+          r.restoredBy && r.restoredBy.role === filters.operatorRole
+        );
+      }
+
+      if (filters.startDate) {
+        const start = new Date(filters.startDate).getTime();
+        records = records.filter(r => new Date(r.timestamp).getTime() >= start);
+      }
+
+      if (filters.endDate) {
+        const end = new Date(filters.endDate).getTime() + 24 * 60 * 60 * 1000;
+        records = records.filter(r => new Date(r.timestamp).getTime() < end);
+      }
+
+      if (filters.dataBlock) {
+        records = records.filter(r =>
+          r.dataBlocks && r.dataBlocks.includes(filters.dataBlock)
+        );
+      }
+
+      if (filters.undone !== undefined) {
+        records = records.filter(r => r.undone === filters.undone);
+      }
+
+      if (filters.isPartial !== undefined) {
+        records = records.filter(r => r.isPartial === filters.isPartial);
+      }
+
+      if (filters.draftId) {
+        records = records.filter(r => r.draftId === filters.draftId);
+      }
+    }
+
+    return records;
+  }
+
   function resetAllData() {
     Object.values(KEYS).forEach(key => remove(key));
   }
@@ -822,6 +1019,19 @@ const Storage = (function() {
     saveBackupSettings,
     cleanupExpiredBackups,
     filterBackupHistory,
+    getRestoreDrafts,
+    saveRestoreDrafts,
+    getRestoreDraftById,
+    addRestoreDraft,
+    updateRestoreDraft,
+    deleteRestoreDraft,
+    filterRestoreDrafts,
+    getConflictStrategyHistory,
+    saveConflictStrategyHistory,
+    addConflictStrategy,
+    findMatchingConflictStrategy,
+    generateConflictKey,
+    filterRestoreRecords,
     resetAllData
   };
 })();

@@ -743,6 +743,561 @@ test('审计日志记录撤回操作', () => {
 console.log('');
 
 // ============================================================
+// 场景 10：恢复方案草稿 CRUD
+// ============================================================
+console.log('--- [场景 10] 恢复方案草稿 CRUD ---\n');
+
+Storage.resetAllData();
+Storage.loadSampleData();
+Auth.login('pharmacist', '123456');
+
+let testDraft = null;
+
+test('药师可以创建恢复方案草稿', () => {
+  const result = ExportModule.createRestoreDraft({
+    name: '测试草稿-001',
+    note: '这是一个测试草稿',
+    dataBlocks: ['shifts', 'drugs'],
+    conflictResolutions: []
+  });
+  assert(result.success, '创建草稿应成功');
+  assert(result.draft, '应返回草稿对象');
+  assert(result.draft.status === 'draft', '状态应为 draft');
+  assert(result.draft.name === '测试草稿-001', '名称应正确');
+  assert(result.draft.dataBlocks.length === 2, '数据块数量应正确');
+  testDraft = result.draft;
+});
+
+test('getRestoreDraft 可以获取草稿详情', () => {
+  const result = ExportModule.getRestoreDraft(testDraft.id);
+  assert(result.success, '获取草稿应成功');
+  assert(result.draft.id === testDraft.id, 'ID 应匹配');
+  assert(result.draft.name === '测试草稿-001', '名称应匹配');
+});
+
+test('listRestoreDrafts 可以列出草稿', () => {
+  const result = ExportModule.listRestoreDrafts();
+  assert(result.success, '列草稿应成功');
+  assert(result.total >= 1, '至少有 1 个草稿');
+  assert(result.drafts.length >= 1, '草稿列表非空');
+});
+
+test('updateRestoreDraft 可以更新草稿', () => {
+  const result = ExportModule.updateRestoreDraft(testDraft.id, {
+    name: '测试草稿-已更新',
+    note: '备注已更新',
+    dataBlocks: ['shifts', 'drugs', 'inventory']
+  });
+  assert(result.success, '更新草稿应成功');
+  assert(result.draft.name === '测试草稿-已更新', '名称应已更新');
+  assert(result.draft.note === '备注已更新', '备注应已更新');
+  assert(result.draft.dataBlocks.length === 3, '数据块应已更新');
+  assert(result.draft.updatedAt !== testDraft.updatedAt, '更新时间应变化');
+  testDraft = result.draft;
+});
+
+test('listRestoreDrafts 按状态筛选', () => {
+  const result = ExportModule.listRestoreDrafts({ status: 'draft' });
+  assert(result.success, '筛选应成功');
+  assert(result.drafts.every(d => d.status === 'draft'), '筛选结果都应是草稿状态');
+});
+
+test('deleteRestoreDraft 可以删除草稿', () => {
+  const result = ExportModule.deleteRestoreDraft(testDraft.id);
+  assert(result.success, '删除草稿应成功');
+
+  const getResult = ExportModule.getRestoreDraft(testDraft.id);
+  assert(!getResult.success, '删除后应无法获取');
+});
+
+console.log('');
+
+// ============================================================
+// 场景 11：草稿跨重启持久化验证
+// ============================================================
+console.log('--- [场景 11] 草稿跨重启持久化验证 ---\n');
+
+Storage.resetAllData();
+Storage.loadSampleData();
+Auth.login('pharmacist', '123456');
+
+let persistentDraftId = null;
+
+test('先创建一个草稿', () => {
+  const result = ExportModule.createRestoreDraft({
+    name: '持久化测试草稿',
+    note: '验证跨重启后仍存在',
+    dataBlocks: ['shifts', 'inventory', 'discrepancies'],
+    conflictResolutions: []
+  });
+  assert(result.success, '创建应成功');
+  persistentDraftId = result.draft.id;
+});
+
+test('模拟重启：重新加载模块后草稿仍存在', () => {
+  const savedDrafts = Storage.getRestoreDrafts();
+  assert(savedDrafts.length > 0, 'localStorage 中应有草稿');
+
+  const found = savedDrafts.find(d => d.id === persistentDraftId);
+  assert(found, '指定草稿应存在于存储中');
+  assert(found.name === '持久化测试草稿', '名称应一致');
+  assert(found.dataBlocks.length === 3, '数据块应一致');
+});
+
+test('模拟重启：重新加载后可正常读取草稿', () => {
+  const result = ExportModule.getRestoreDraft(persistentDraftId);
+  assert(result.success, '重启后获取草稿应成功');
+  assert(result.draft.name === '持久化测试草稿', '重启后名称应一致');
+});
+
+console.log('');
+
+// ============================================================
+// 场景 12：草稿权限控制
+// ============================================================
+console.log('--- [场景 12] 草稿权限控制 ---\n');
+
+Storage.resetAllData();
+Storage.loadSampleData();
+Auth.login('pharmacist', '123456');
+
+let nurseTestDraftId = null;
+
+test('药师先创建一个草稿用于权限测试', () => {
+  const result = ExportModule.createRestoreDraft({
+    name: '权限测试草稿',
+    dataBlocks: ['shifts'],
+    conflictResolutions: []
+  });
+  assert(result.success, '药师创建草稿应成功');
+  nurseTestDraftId = result.draft.id;
+});
+
+test('护士登录后可以查看草稿列表', () => {
+  Auth.login('nurse', '123456');
+  const result = ExportModule.listRestoreDrafts();
+  assert(result.success, '护士查看草稿列表应成功');
+  assert(result.total >= 1, '应能看到草稿');
+});
+
+test('护士登录后可以查看草稿详情', () => {
+  const result = ExportModule.getRestoreDraft(nurseTestDraftId);
+  assert(result.success, '护士查看草稿详情应成功');
+});
+
+test('护士无法创建草稿', () => {
+  const result = ExportModule.createRestoreDraft({
+    name: '护士尝试创建',
+    dataBlocks: ['shifts'],
+    conflictResolutions: []
+  });
+  assert(!result.success, '护士创建草稿应失败');
+  assert(result.message.includes('药师'), '错误信息应提到药师');
+});
+
+test('护士无法更新草稿', () => {
+  const result = ExportModule.updateRestoreDraft(nurseTestDraftId, {
+    name: '护士尝试修改'
+  });
+  assert(!result.success, '护士更新草稿应失败');
+});
+
+test('护士无法删除草稿', () => {
+  const result = ExportModule.deleteRestoreDraft(nurseTestDraftId);
+  assert(!result.success, '护士删除草稿应失败');
+});
+
+test('护士无法提交草稿', () => {
+  const backup = ExportModule.createBackup();
+  const result = ExportModule.submitRestoreDraft(nurseTestDraftId, backup);
+  assert(!result.success, '护士提交草稿应失败');
+});
+
+test('切回药师后可以正常操作草稿', () => {
+  Auth.login('pharmacist', '123456');
+  const result = ExportModule.updateRestoreDraft(nurseTestDraftId, {
+    name: '药师已修改'
+  });
+  assert(result.success, '药师更新草稿应成功');
+  assert(result.draft.name === '药师已修改', '名称应已修改');
+});
+
+console.log('');
+
+// ============================================================
+// 场景 13：提交草稿执行恢复 + 撤回联动
+// ============================================================
+console.log('--- [场景 13] 提交草稿执行恢复 + 撤回联动 ---\n');
+
+Storage.resetAllData();
+Storage.loadSampleData();
+Auth.login('pharmacist', '123456');
+
+let submitBackup = null;
+let submitDraftId = null;
+let submitRecordId = null;
+
+test('准备：创建一个有差异的备份', () => {
+  Storage.clearCurrentShift();
+  Storage.saveShiftHistory([]);
+  Shift.openShift('草稿提交测试班');
+  Inventory.initializeInventory();
+  submitBackup = deepClone(ExportModule.createBackup());
+
+  Storage.clearCurrentShift();
+  Shift.openShift('本地现有班');
+  Inventory.initializeInventory();
+});
+
+test('创建草稿并提交执行恢复', () => {
+  const conflicts = ExportModule.detectConflicts(submitBackup);
+  const resolutions = [];
+  conflicts.shifts.forEach(c => {
+    resolutions.push(ExportModule.resolveConflictStrategy(c, 'overwrite'));
+  });
+
+  const draftResult = ExportModule.createRestoreDraft({
+    name: '提交执行草稿',
+    note: '测试草稿提交后执行恢复',
+    dataBlocks: ExportModule.getAllDataBlocks(),
+    conflictResolutions: resolutions
+  });
+  assert(draftResult.success, '创建草稿应成功');
+  submitDraftId = draftResult.draft.id;
+
+  Storage.clearCurrentShift();
+
+  const submitResult = ExportModule.submitRestoreDraft(submitDraftId, submitBackup);
+  assert(submitResult.success, `提交执行应成功：${submitResult.message || ''}`);
+  assert(submitResult.restoreRecordId, '应有恢复记录ID');
+  submitRecordId = submitResult.restoreRecordId;
+});
+
+test('提交后草稿状态变为 executed', () => {
+  const result = ExportModule.getRestoreDraft(submitDraftId);
+  assert(result.success, '获取草稿应成功');
+  assert(result.draft.status === 'executed', '草稿状态应为 executed');
+  assert(result.draft.restoreRecordId === submitRecordId, '草稿应关联恢复记录ID');
+});
+
+test('恢复记录应关联草稿信息', () => {
+  const records = Storage.getRestoreRecords();
+  const record = records.find(r => r.id === submitRecordId);
+  assert(record, '应找到恢复记录');
+  assert(record.draftId === submitDraftId, '记录应关联草稿ID');
+  assert(record.draftName === '提交执行草稿', '记录应关联草稿名称');
+});
+
+test('已执行的草稿不能再次编辑', () => {
+  const result = ExportModule.updateRestoreDraft(submitDraftId, {
+    name: '尝试修改已执行的草稿'
+  });
+  assert(!result.success, '修改已执行的草稿应失败');
+});
+
+test('已执行的草稿不能再次提交', () => {
+  const result = ExportModule.submitRestoreDraft(submitDraftId, submitBackup);
+  assert(!result.success, '重复提交应失败');
+});
+
+console.log('');
+
+// ============================================================
+// 场景 14：冲突策略历史记录与复用提示
+// ============================================================
+console.log('--- [场景 14] 冲突策略历史记录与复用提示 ---\n');
+
+Storage.resetAllData();
+Storage.loadSampleData();
+Auth.login('pharmacist', '123456');
+
+let strategyTestBackup = null;
+
+test('准备：制造冲突并执行一次恢复以记录策略', () => {
+  Storage.clearCurrentShift();
+  Storage.saveShiftHistory([]);
+  Shift.openShift('策略测试班A');
+  Inventory.initializeInventory();
+
+  const drugs = Storage.getDrugs();
+  const drug = { ...drugs[0], initialStock: 999 };
+  const allDrugs = drugs.map(d => d.code === drug.code ? drug : d);
+  Storage.saveDrugs(allDrugs);
+
+  strategyTestBackup = deepClone(ExportModule.createBackup());
+
+  Storage.resetAllData();
+  Storage.loadSampleData();
+  Auth.login('pharmacist', '123456');
+});
+
+test('首次导入：checkConflictStrategyReuse 提示无历史策略', () => {
+  const conflicts = ExportModule.detectConflicts(strategyTestBackup);
+  const result = ExportModule.checkConflictStrategyReuse(conflicts);
+  assert(result.success, '检查应成功');
+  assert(!result.hasMatches, '首次应没有匹配的历史策略');
+  assert(result.matchedCount === 0, '匹配数应为 0');
+});
+
+test('执行一次恢复（选择 overwrite 策略），策略会被记录', () => {
+  const conflicts = ExportModule.detectConflicts(strategyTestBackup);
+  const resolutions = [];
+
+  conflicts.shifts.forEach(c => {
+    resolutions.push(ExportModule.resolveConflictStrategy(c, 'overwrite'));
+  });
+  conflicts.drugs.forEach(c => {
+    resolutions.push(ExportModule.resolveConflictStrategy(c, 'overwrite'));
+  });
+
+  Storage.clearCurrentShift();
+  const result = ExportModule.applyBackup(strategyTestBackup, resolutions);
+  assert(result.success, `恢复应成功：${result.message || ''}`);
+
+  const history = Storage.getConflictStrategyHistory();
+  assert(history.length > 0, '冲突策略历史应有记录');
+});
+
+test('再次导入同一备份：checkConflictStrategyReuse 提示可复用', () => {
+  const savedStrategyHistory = Storage.getConflictStrategyHistory();
+
+  Storage.resetAllData();
+  Storage.loadSampleData();
+  Auth.login('pharmacist', '123456');
+
+  Storage.saveConflictStrategyHistory(savedStrategyHistory);
+
+  const conflicts = ExportModule.detectConflicts(strategyTestBackup);
+  const result = ExportModule.checkConflictStrategyReuse(conflicts);
+  assert(result.success, '检查应成功');
+  assert(result.hasMatches, '应有匹配的历史策略');
+  assert(result.matchedCount > 0, '匹配数应大于 0');
+  assert(result.promptMessage && result.promptMessage.length > 0, '应有提示消息');
+});
+
+test('applyConflictStrategyReuse 可以批量复用策略', () => {
+  const conflicts = ExportModule.detectConflicts(strategyTestBackup);
+  const result = ExportModule.applyConflictStrategyReuse(conflicts, true);
+  assert(result.success, '复用应成功');
+  assert(result.appliedCount > 0, '应用数应大于 0');
+  assert(result.resolutions.length === result.appliedCount, '返回的决议数应等于应用数');
+
+  result.resolutions.forEach(r => {
+    assert(r.strategy === 'overwrite', '复用的策略应为 overwrite');
+    assert(r.conflict, '每个决议都应关联冲突对象');
+  });
+});
+
+test('复用的策略不是静默套用，需要显式调用', () => {
+  const conflicts = ExportModule.detectConflicts(strategyTestBackup);
+  const checkResult = ExportModule.checkConflictStrategyReuse(conflicts);
+  assert(checkResult.hasMatches, '检测到可复用策略');
+
+  const historyBefore = Storage.getConflictStrategyHistory();
+  const countBefore = historyBefore.length;
+
+  Storage.clearCurrentShift();
+  const result = ExportModule.applyBackup(strategyTestBackup, []);
+  assert(result.success, '不传入复用策略时，使用默认策略');
+
+  const historyAfter = Storage.getConflictStrategyHistory();
+  assert(historyAfter.length >= countBefore, '策略历史数量不应减少');
+});
+
+console.log('');
+
+// ============================================================
+// 场景 15：恢复记录筛选与前后数据对比
+// ============================================================
+console.log('--- [场景 15] 恢复记录筛选与前后数据对比 ---\n');
+
+Storage.resetAllData();
+Storage.loadSampleData();
+Auth.login('pharmacist', '123456');
+
+let filterBackup = null;
+let filterRecordId = null;
+
+test('准备：执行几次恢复以便筛选', () => {
+  Storage.clearCurrentShift();
+  Storage.saveShiftHistory([]);
+  Shift.openShift('筛选测试班');
+  Inventory.initializeInventory();
+  filterBackup = deepClone(ExportModule.createBackup());
+
+  Storage.clearCurrentShift();
+
+  const result = ExportModule.applyBackup(filterBackup, []);
+  assert(result.success, '恢复应成功');
+  filterRecordId = result.restoreRecordId;
+});
+
+test('filterRestoreRecords 可以按操作者筛选', () => {
+  const result = ExportModule.filterRestoreRecords({
+    operatorName: '张药师'
+  });
+  assert(result.success, '筛选应成功');
+  assert(result.records.every(r => r.restoredBy && r.restoredBy.name === '张药师'),
+    '所有记录都应由张药师操作');
+});
+
+test('filterRestoreRecords 可以按数据块筛选', () => {
+  const result = ExportModule.filterRestoreRecords({
+    dataBlock: 'shifts'
+  });
+  assert(result.success, '按数据块筛选应成功');
+  assert(result.records.every(r => r.dataBlocks && r.dataBlocks.includes('shifts')),
+    '所有记录都应包含班次数据块');
+});
+
+test('filterRestoreRecords 可以按状态筛选', () => {
+  const result = ExportModule.filterRestoreRecords({ status: 'success' });
+  assert(result.success, '按状态筛选应成功');
+  assert(result.records.every(r => r.status === 'success'),
+    '所有记录都应为成功状态');
+});
+
+test('filterRestoreRecords 可以按是否撤回筛选', () => {
+  const result = ExportModule.filterRestoreRecords({ undone: false });
+  assert(result.success, '按撤回状态筛选应成功');
+  assert(result.records.every(r => r.undone === false),
+    '所有记录都应为未撤回状态');
+});
+
+test('getRestoreRecordWithChanges 返回带变更详情的记录', () => {
+  const result = ExportModule.getRestoreRecordWithChanges(filterRecordId);
+  assert(result.success, '获取详情应成功');
+  assert(result.record, '应有记录数据');
+  assert(result.changes, '应有变更数据');
+  assert(result.changes.shifts, '应有班次变更统计');
+  assert(result.changes.drugs, '应有药品变更统计');
+  assert(result.changes.corrections, '应有修正变更统计');
+  assert(result.changes.auditLogs, '应有审计日志变更统计');
+  assert(result.conflictResolutions, '应有冲突决议');
+  assert(result.dataBlocks, '应有数据块列表');
+});
+
+test('getRestoreRecordWithChanges 指示是否可撤回', () => {
+  const result = ExportModule.getRestoreRecordWithChanges(filterRecordId);
+  assert(result.success, '获取详情应成功');
+  assert(result.isUndoable === true, '最新成功的恢复应可撤回');
+});
+
+console.log('');
+
+// ============================================================
+// 场景 16：撤回后禁止重复撤回
+// ============================================================
+console.log('--- [场景 16] 撤回后禁止重复撤回 ---\n');
+
+Storage.resetAllData();
+Storage.loadSampleData();
+Auth.login('pharmacist', '123456');
+
+let undoTestBackup = null;
+let undoTestRecordId = null;
+
+test('准备：执行一次成功的恢复', () => {
+  Storage.clearCurrentShift();
+  Storage.saveShiftHistory([]);
+  Shift.openShift('撤回测试班');
+  Inventory.initializeInventory();
+  undoTestBackup = deepClone(ExportModule.createBackup());
+
+  Storage.clearCurrentShift();
+
+  const result = ExportModule.applyBackup(undoTestBackup, []);
+  assert(result.success, '恢复应成功');
+  undoTestRecordId = result.restoreRecordId;
+});
+
+test('第一次撤回应成功', () => {
+  const result = ExportModule.undoRestoreByRecordId(undoTestRecordId);
+  assert(result.success, `第一次撤回应成功：${result.message || ''}`);
+  assert(result.record.undone === true, '记录应标记为已撤回');
+  assert(result.record.undoneBy, '应有撤回人信息');
+  assert(result.record.undoneAt, '应有撤回时间');
+});
+
+test('撤回后再次撤回应被拒绝', () => {
+  const result = ExportModule.undoRestoreByRecordId(undoTestRecordId);
+  assert(!result.success, '重复撤回应失败');
+  assert(result.message.includes('已被撤回') || result.message.includes('重复'),
+    '错误信息应说明已被撤回');
+});
+
+test('undoLastRestore 也不能重复撤回', () => {
+  const result = ExportModule.undoLastRestore();
+  assert(!result.success, 'undoLastRestore 重复撤回应失败');
+});
+
+test('撤回后恢复记录的 undone 状态保持为 true', () => {
+  const records = Storage.getRestoreRecords();
+  const record = records.find(r => r.id === undoTestRecordId);
+  assert(record, '记录应存在');
+  assert(record.undone === true, 'undone 应保持为 true');
+});
+
+test('撤回后快照已被清除', () => {
+  const snapshot = Storage.getLastRestoreSnapshot();
+  assert(!snapshot, '撤回后快照应被清除');
+});
+
+console.log('');
+
+// ============================================================
+// 场景 17：草稿执行后撤回联动
+// ============================================================
+console.log('--- [场景 17] 草稿执行后撤回联动 ---\n');
+
+Storage.resetAllData();
+Storage.loadSampleData();
+Auth.login('pharmacist', '123456');
+
+let draftUndoBackup = null;
+let draftUndoDraftId = null;
+let draftUndoRecordId = null;
+
+test('准备：创建草稿并提交执行', () => {
+  Storage.clearCurrentShift();
+  Storage.saveShiftHistory([]);
+  Shift.openShift('草稿撤回测试班');
+  Inventory.initializeInventory();
+  draftUndoBackup = deepClone(ExportModule.createBackup());
+
+  const draftResult = ExportModule.createRestoreDraft({
+    name: '撤回联动测试草稿',
+    dataBlocks: ExportModule.getAllDataBlocks(),
+    conflictResolutions: []
+  });
+  assert(draftResult.success, '创建草稿应成功');
+  draftUndoDraftId = draftResult.draft.id;
+
+  Storage.clearCurrentShift();
+
+  const submitResult = ExportModule.submitRestoreDraft(draftUndoDraftId, draftUndoBackup);
+  assert(submitResult.success, '提交执行应成功');
+  draftUndoRecordId = submitResult.restoreRecordId;
+});
+
+test('撤回后草稿状态变为 undone', () => {
+  const result = ExportModule.undoRestoreByRecordId(draftUndoRecordId);
+  assert(result.success, '撤回应成功');
+
+  const draftResult = ExportModule.getRestoreDraft(draftUndoDraftId);
+  assert(draftResult.success, '获取草稿应成功');
+  assert(draftResult.draft.status === 'undone', '草稿状态应为 undone');
+  assert(draftResult.draft.undoneAt, '草稿应有撤回时间');
+});
+
+test('已撤回的草稿不能再次提交', () => {
+  const result = ExportModule.submitRestoreDraft(draftUndoDraftId, draftUndoBackup);
+  assert(!result.success, '已撤回草稿提交应失败');
+});
+
+console.log('');
+
+// ============================================================
 // 汇总
 // ============================================================
 const passed = results.filter(r => r.pass).length;

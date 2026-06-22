@@ -1511,6 +1511,8 @@ const ExportModule = (function() {
           `恢复 ${dataBlocks.map(b => getDataBlockLabel(b)).join('、')}，记录ID: ${record.id}`,
           user
         );
+
+        saveConflictStrategiesFromResolutions(conflictResolutions || [], user);
       } else {
         throw new Error(result.message || '恢复失败');
       }
@@ -1688,6 +1690,8 @@ const ExportModule = (function() {
         result.restoreRecordId = record.id;
         result.restoreRecord = record;
         result.isPartial = false;
+
+        saveConflictStrategiesFromResolutions(conflictResolutions || [], user);
 
         const logs = Storage.getAuditLogs();
         const restoreLog = logs.find(l => l.action === '导入数据备份');
@@ -2070,6 +2074,435 @@ const ExportModule = (function() {
     return parts.join('，');
   }
 
+  function createRestoreDraft(options) {
+    const user = Auth.getCurrentUser();
+    if (!user) {
+      return { success: false, message: '请先登录' };
+    }
+    if (!Auth.canCreateRestoreDraft()) {
+      return { success: false, message: '只有药师可以创建恢复方案草稿' };
+    }
+
+    const backup = options.backup || null;
+    const dataBlocks = options.dataBlocks || getAllDataBlocks();
+    const conflictResolutions = options.conflictResolutions || [];
+    const name = options.name || '';
+    const note = options.note || '';
+    const backupInfo = options.backupInfo || null;
+
+    const draftData = {
+      name: name,
+      note: note,
+      dataBlocks: dataBlocks,
+      conflictResolutions: conflictResolutions,
+      backupInfo: backupInfo ? {
+        version: backupInfo.version,
+        exportedAt: backupInfo.exportedAt,
+        exportedAtFormatted: backupInfo.exportedAtFormatted,
+        exportedBy: backupInfo.exportedBy || null,
+        backupId: backupInfo.id || null,
+        summary: backupInfo.summary || null
+      } : null,
+      createdBy: { id: user.id, name: user.name, role: user.role },
+      status: 'draft'
+    };
+
+    const draft = Storage.addRestoreDraft(draftData);
+
+    Storage.addAuditLog(
+      '创建恢复方案草稿',
+      `创建恢复方案草稿「${name || '未命名'}」，涉及${dataBlocks.length}个数据块`,
+      user
+    );
+
+    return { success: true, draft: draft };
+  }
+
+  function getRestoreDraft(draftId) {
+    const user = Auth.getCurrentUser();
+    if (!user) {
+      return { success: false, message: '请先登录' };
+    }
+    if (!Auth.canViewRestoreDrafts()) {
+      return { success: false, message: '您没有查看恢复方案草稿的权限' };
+    }
+
+    const draft = Storage.getRestoreDraftById(draftId);
+    if (!draft) {
+      return { success: false, message: '草稿不存在' };
+    }
+
+    return { success: true, draft: draft };
+  }
+
+  function listRestoreDrafts(filters) {
+    const user = Auth.getCurrentUser();
+    if (!user) {
+      return { success: false, message: '请先登录' };
+    }
+    if (!Auth.canViewRestoreDrafts()) {
+      return { success: false, message: '您没有查看恢复方案草稿的权限' };
+    }
+
+    const drafts = Storage.filterRestoreDrafts(filters);
+    return { success: true, drafts: drafts, total: drafts.length };
+  }
+
+  function updateRestoreDraft(draftId, updates) {
+    const user = Auth.getCurrentUser();
+    if (!user) {
+      return { success: false, message: '请先登录' };
+    }
+
+    const draft = Storage.getRestoreDraftById(draftId);
+    if (!draft) {
+      return { success: false, message: '草稿不存在' };
+    }
+
+    if (!Auth.canEditRestoreDraft(draft)) {
+      return { success: false, message: '只有药师可以编辑草稿，且草稿状态需为「草稿中」' };
+    }
+
+    const allowedFields = ['name', 'note', 'dataBlocks', 'conflictResolutions', 'backupInfo'];
+    const cleanUpdates = {};
+    Object.keys(updates).forEach(key => {
+      if (allowedFields.includes(key)) {
+        cleanUpdates[key] = updates[key];
+      }
+    });
+
+    const updated = Storage.updateRestoreDraft(draftId, cleanUpdates);
+
+    Storage.addAuditLog(
+      '更新恢复方案草稿',
+      `更新恢复方案草稿「${updated.name || draft.name || '未命名'}」`,
+      user
+    );
+
+    return { success: true, draft: updated };
+  }
+
+  function deleteRestoreDraft(draftId) {
+    const user = Auth.getCurrentUser();
+    if (!user) {
+      return { success: false, message: '请先登录' };
+    }
+    if (!Auth.canDeleteRestoreDraft()) {
+      return { success: false, message: '只有药师可以删除恢复方案草稿' };
+    }
+
+    const draft = Storage.getRestoreDraftById(draftId);
+    if (!draft) {
+      return { success: false, message: '草稿不存在' };
+    }
+
+    const deleted = Storage.deleteRestoreDraft(draftId);
+    if (!deleted) {
+      return { success: false, message: '删除失败' };
+    }
+
+    Storage.addAuditLog(
+      '删除恢复方案草稿',
+      `删除恢复方案草稿「${draft.name || '未命名'}」`,
+      user
+    );
+
+    return { success: true };
+  }
+
+  function submitRestoreDraft(draftId, backup) {
+    const user = Auth.getCurrentUser();
+    if (!user) {
+      return { success: false, message: '请先登录' };
+    }
+    if (!Auth.canSubmitRestoreDraft()) {
+      return { success: false, message: '只有药师可以提交恢复方案' };
+    }
+
+    const draft = Storage.getRestoreDraftById(draftId);
+    if (!draft) {
+      return { success: false, message: '草稿不存在' };
+    }
+    if (draft.status !== 'draft') {
+      return { success: false, message: '草稿状态不正确，无法提交' };
+    }
+
+    const conflictResolutions = draft.conflictResolutions || [];
+    const dataBlocks = draft.dataBlocks || getAllDataBlocks();
+
+    let result;
+    const isPartial = dataBlocks.length < getAllDataBlocks().length;
+
+    if (isPartial) {
+      result = applyPartialBackup(backup, dataBlocks, conflictResolutions);
+    } else {
+      result = applyBackupWithTracking(backup, conflictResolutions);
+    }
+
+    if (result.success) {
+      Storage.updateRestoreDraft(draftId, {
+        status: 'executed',
+        executedAt: new Date().toISOString(),
+        executedAtFormatted: Storage.formatDateTime(new Date()),
+        restoreRecordId: result.restoreRecordId
+      });
+
+      if (result.restoreRecordId) {
+        const records = Storage.getRestoreRecords();
+        const idx = records.findIndex(r => r.id === result.restoreRecordId);
+        if (idx >= 0) {
+          records[idx] = { ...records[idx], draftId: draftId, draftName: draft.name };
+          Storage.set(Storage.KEYS.RESTORE_RECORDS, records);
+        }
+      }
+
+      saveConflictStrategiesFromResolutions(conflictResolutions, user);
+
+      Storage.addAuditLog(
+        '提交恢复方案草稿',
+        `提交并执行恢复方案「${draft.name || '未命名'}」，恢复记录ID: ${result.restoreRecordId}`,
+        user
+      );
+    }
+
+    return result;
+  }
+
+  function saveConflictStrategiesFromResolutions(resolutions, user) {
+    if (!resolutions || resolutions.length === 0) return;
+
+    resolutions.forEach(r => {
+      const conflict = r.conflict;
+      if (!conflict) return;
+
+      const conflictKey = Storage.generateConflictKey(conflict);
+      const existing = Storage.findMatchingConflictStrategy(conflict);
+
+      if (existing) {
+        const history = Storage.getConflictStrategyHistory();
+        const idx = history.findIndex(h => h.id === existing.id);
+        if (idx >= 0) {
+          history[idx] = {
+            ...history[idx],
+            strategy: r.strategy,
+            lastUsedAt: new Date().toISOString(),
+            lastUsedAtFormatted: Storage.formatDateTime(new Date()),
+            usedBy: user ? { id: user.id, name: user.name, role: user.role } : null,
+            useCount: (existing.useCount || 1) + 1
+          };
+          Storage.saveConflictStrategyHistory(history);
+        }
+      } else {
+        Storage.addConflictStrategy({
+          conflictKey: conflictKey,
+          conflictType: conflict.type,
+          conflictTarget: conflict.importedName || conflict.drugCode || (conflict.importedShiftId + '_' + (conflict.correction?.requestedAt || '')),
+          strategy: r.strategy,
+          firstUsedAt: new Date().toISOString(),
+          firstUsedAtFormatted: Storage.formatDateTime(new Date()),
+          lastUsedAt: new Date().toISOString(),
+          lastUsedAtFormatted: Storage.formatDateTime(new Date()),
+          usedBy: user ? { id: user.id, name: user.name, role: user.role } : null,
+          useCount: 1
+        });
+      }
+    });
+  }
+
+  function checkConflictStrategyReuse(conflicts) {
+    const user = Auth.getCurrentUser();
+    if (!user) {
+      return { success: false, message: '请先登录' };
+    }
+
+    const allConflicts = [
+      ...(conflicts.shifts || []),
+      ...(conflicts.corrections || []),
+      ...(conflicts.drugs || [])
+    ];
+
+    const matched = [];
+    const unmatched = [];
+
+    allConflicts.forEach(conflict => {
+      const existing = Storage.findMatchingConflictStrategy(conflict);
+      if (existing) {
+        matched.push({
+          conflict: conflict,
+          previousStrategy: existing.strategy,
+          previousUsedAt: existing.lastUsedAtFormatted,
+          previousUsedBy: existing.usedBy ? existing.usedBy.name : null,
+          useCount: existing.useCount || 1
+        });
+      } else {
+        unmatched.push(conflict);
+      }
+    });
+
+    return {
+      success: true,
+      hasMatches: matched.length > 0,
+      matchedCount: matched.length,
+      totalCount: allConflicts.length,
+      matched: matched,
+      unmatched: unmatched,
+      promptMessage: matched.length > 0
+        ? `检测到 ${matched.length} 项冲突曾处理过，是否复用上次的策略？`
+        : ''
+    };
+  }
+
+  function applyConflictStrategyReuse(conflicts, reuseAll) {
+    const allConflicts = [
+      ...(conflicts.shifts || []),
+      ...(conflicts.corrections || []),
+      ...(conflicts.drugs || [])
+    ];
+
+    const resolutions = [];
+    allConflicts.forEach(conflict => {
+      const existing = Storage.findMatchingConflictStrategy(conflict);
+      if (existing) {
+        resolutions.push(resolveConflictStrategy(conflict, existing.strategy));
+      }
+    });
+
+    return {
+      success: true,
+      resolutions: resolutions,
+      appliedCount: resolutions.length
+    };
+  }
+
+  function getRestoreRecordWithChanges(recordId) {
+    const records = Storage.getRestoreRecords();
+    const record = records.find(r => r.id === recordId);
+    if (!record) {
+      return { success: false, message: '恢复记录不存在' };
+    }
+
+    const snapshot = Storage.getLastRestoreSnapshot();
+    const isLatestUndoable = !record.undone && record.status === 'success' && !!snapshot;
+
+    const changes = {
+      shifts: {
+        before: record.beforeSnapshot ? (record.beforeSnapshot.shiftHistory ? record.beforeSnapshot.shiftHistory.length : 0) : null,
+        after: record.results ? record.results.importedShifts + record.results.overwrittenShifts + record.results.mergedShifts + record.results.skippedShifts : null,
+        imported: record.results ? record.results.importedShifts : 0,
+        overwritten: record.results ? record.results.overwrittenShifts : 0,
+        merged: record.results ? record.results.mergedShifts : 0,
+        skipped: record.results ? record.results.skippedShifts : 0
+      },
+      drugs: {
+        imported: record.results ? record.results.importedDrugs : 0,
+        overwritten: record.results ? record.results.overwrittenDrugs : 0,
+        merged: record.results ? record.results.mergedDrugs : 0
+      },
+      corrections: {
+        overwritten: record.results ? record.results.overwrittenCorrections : 0,
+        merged: record.results ? record.results.mergedCorrections : 0
+      },
+      auditLogs: {
+        imported: record.results ? record.results.importedAuditLogs : 0
+      }
+    };
+
+    return {
+      success: true,
+      record: record,
+      changes: changes,
+      isUndoable: isLatestUndoable,
+      conflictResolutions: record.conflictResolutions || [],
+      dataBlocks: record.dataBlocks || [],
+      draftInfo: record.draftId ? {
+        draftId: record.draftId,
+        draftName: record.draftName
+      } : null
+    };
+  }
+
+  function filterRestoreRecords(filters) {
+    const user = Auth.getCurrentUser();
+    if (!user) {
+      return { success: false, message: '请先登录' };
+    }
+    if (!Auth.canViewRestoreRecords()) {
+      return { success: false, message: '您没有查看恢复记录的权限' };
+    }
+
+    const records = Storage.filterRestoreRecords(filters);
+    return { success: true, records: records, total: records.length };
+  }
+
+  function undoRestoreByRecordId(recordId) {
+    const user = Auth.getCurrentUser();
+    if (!user) {
+      return { success: false, message: '请先登录' };
+    }
+    if (!Auth.canUndoRestore()) {
+      return { success: false, message: '只有药师可以撤回恢复操作' };
+    }
+
+    const records = Storage.getRestoreRecords();
+    const recordIdx = records.findIndex(r => r.id === recordId);
+    if (recordIdx < 0) {
+      return { success: false, message: '恢复记录不存在' };
+    }
+
+    const record = records[recordIdx];
+    if (record.undone) {
+      return { success: false, message: '该恢复操作已被撤回，无法重复撤回' };
+    }
+    if (record.status !== 'success') {
+      return { success: false, message: '只有成功的恢复操作才能撤回' };
+    }
+
+    if (recordIdx !== 0) {
+      return { success: false, message: '只能撤回最近一次成功的恢复操作' };
+    }
+
+    const snapshot = Storage.getLastRestoreSnapshot();
+    if (!snapshot) {
+      return { success: false, message: '没有可撤回的恢复前快照数据' };
+    }
+
+    const restored = Storage.restoreFromSnapshot(snapshot);
+    if (!restored) {
+      return { success: false, message: '撤回失败：快照恢复出错' };
+    }
+
+    records[recordIdx] = {
+      ...record,
+      undone: true,
+      undoneAt: new Date().toISOString(),
+      undoneAtFormatted: Storage.formatDateTime(new Date()),
+      undoneBy: { id: user.id, name: user.name, role: user.role }
+    };
+    Storage.set(Storage.KEYS.RESTORE_RECORDS, records);
+
+    Storage.clearLastRestoreSnapshot();
+
+    if (record.draftId) {
+      Storage.updateRestoreDraft(record.draftId, {
+        status: 'undone',
+        undoneAt: new Date().toISOString(),
+        undoneAtFormatted: Storage.formatDateTime(new Date())
+      });
+    }
+
+    Storage.addAuditLog(
+      '撤回数据恢复',
+      `撤回了 ${record.timestampFormatted} 的恢复操作（记录ID: ${record.id}），由 ${user.name} 执行`,
+      user
+    );
+
+    return {
+      success: true,
+      message: '恢复操作已成功撤回，数据已还原到恢复前状态',
+      record: records[recordIdx]
+    };
+  }
+
   return {
     generateShiftReport,
     downloadReport,
@@ -2102,6 +2535,17 @@ const ExportModule = (function() {
     getConflictDetail,
     getConflictsGrouped,
     getRestoreRecordDetail,
-    buildRestoreChangeSummary
+    buildRestoreChangeSummary,
+    createRestoreDraft,
+    getRestoreDraft,
+    listRestoreDrafts,
+    updateRestoreDraft,
+    deleteRestoreDraft,
+    submitRestoreDraft,
+    checkConflictStrategyReuse,
+    applyConflictStrategyReuse,
+    getRestoreRecordWithChanges,
+    filterRestoreRecords,
+    undoRestoreByRecordId
   };
 })();
