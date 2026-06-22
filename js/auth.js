@@ -40,12 +40,12 @@ const Auth = (function() {
 
   function isPharmacist() {
     const user = getCurrentUser();
-    return user && user.role === 'pharmacist';
+    return !!(user && user.role === 'pharmacist');
   }
 
   function isNurse() {
     const user = getCurrentUser();
-    return user && user.role === 'nurse';
+    return !!(user && user.role === 'nurse');
   }
 
   function requirePharmacist() {
@@ -57,7 +57,7 @@ const Auth = (function() {
 
   function canEditInventory() {
     const user = getCurrentUser();
-    return user && (user.role === 'pharmacist' || user.role === 'nurse');
+    return !!(user && (user.role === 'pharmacist' || user.role === 'nurse'));
   }
 
   function canResolveDiscrepancy() {
@@ -80,6 +80,19 @@ const Auth = (function() {
     return isPharmacist();
   }
 
+  function canPerformPartialRestore() {
+    return isPharmacist();
+  }
+
+  function canViewRestoreRecords() {
+    const user = getCurrentUser();
+    return !!(user && (user.role === 'pharmacist' || user.role === 'nurse'));
+  }
+
+  function canManageBackups() {
+    return isPharmacist();
+  }
+
   return {
     login,
     logout,
@@ -93,6 +106,9 @@ const Auth = (function() {
     canCloseShift,
     canApproveCorrection,
     canUndoRestore,
-    canPerformRestore
+    canPerformRestore,
+    canPerformPartialRestore,
+    canViewRestoreRecords,
+    canManageBackups
   };
 })();

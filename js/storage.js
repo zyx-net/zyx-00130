@@ -12,7 +12,10 @@ const Storage = (function() {
     CURRENT_USER: PREFIX + 'current_user',
     INITIALIZED: PREFIX + 'initialized',
     RESTORE_RECORDS: PREFIX + 'restore_records',
-    LAST_RESTORE_SNAPSHOT: PREFIX + 'last_restore_snapshot'
+    LAST_RESTORE_SNAPSHOT: PREFIX + 'last_restore_snapshot',
+    BACKUP_HISTORY: PREFIX + 'backup_history',
+    RESTORE_LOCK: PREFIX + 'restore_lock',
+    BACKUP_SETTINGS: PREFIX + 'backup_settings'
   };
 
   function get(key, defaultValue = null) {
@@ -569,6 +572,199 @@ const Storage = (function() {
     }
   }
 
+  function getBackupHistory() {
+    return get(KEYS.BACKUP_HISTORY, []);
+  }
+
+  function saveBackupHistory(history) {
+    return set(KEYS.BACKUP_HISTORY, history);
+  }
+
+  function addBackupToHistory(backupInfo) {
+    const history = getBackupHistory();
+    const fullInfo = {
+      id: generateId('backup'),
+      createdAt: new Date().toISOString(),
+      createdAtFormatted: formatDateTime(new Date()),
+      name: '',
+      note: '',
+      ...backupInfo
+    };
+    history.unshift(fullInfo);
+    saveBackupHistory(history);
+    return fullInfo;
+  }
+
+  function updateBackupInfo(backupId, updates) {
+    const history = getBackupHistory();
+    const idx = history.findIndex(b => b.id === backupId);
+    if (idx >= 0) {
+      history[idx] = { ...history[idx], ...updates };
+      saveBackupHistory(history);
+      return history[idx];
+    }
+    return null;
+  }
+
+  function deleteBackupFromHistory(backupId) {
+    const history = getBackupHistory();
+    const filtered = history.filter(b => b.id !== backupId);
+    saveBackupHistory(filtered);
+    return filtered.length !== history.length;
+  }
+
+  function getBackupById(backupId) {
+    const history = getBackupHistory();
+    return history.find(b => b.id === backupId) || null;
+  }
+
+  function getRestoreLock() {
+    return get(KEYS.RESTORE_LOCK, null);
+  }
+
+  function acquireRestoreLock(operator) {
+    const existing = getRestoreLock();
+    if (existing) {
+      const now = Date.now();
+      const lockTime = new Date(existing.acquiredAt).getTime();
+      const elapsed = now - lockTime;
+      if (elapsed < 5 * 60 * 1000) {
+        return { success: false, lock: existing, reason: '已有恢复操作进行中，请稍后再试' };
+      }
+    }
+    const lock = {
+      id: generateId('lock'),
+      acquiredAt: new Date().toISOString(),
+      acquiredAtFormatted: formatDateTime(new Date()),
+      operator: operator ? { id: operator.id, name: operator.name, role: operator.role } : null
+    };
+    set(KEYS.RESTORE_LOCK, lock);
+    return { success: true, lock: lock };
+  }
+
+  function releaseRestoreLock() {
+    remove(KEYS.RESTORE_LOCK);
+    return true;
+  }
+
+  function refreshRestoreLock() {
+    const lock = getRestoreLock();
+    if (lock) {
+      lock.acquiredAt = new Date().toISOString();
+      lock.acquiredAtFormatted = formatDateTime(new Date());
+      set(KEYS.RESTORE_LOCK, lock);
+      return lock;
+    }
+    return null;
+  }
+
+  function getBackupSettings() {
+    const defaults = {
+      autoCleanupEnabled: true,
+      retentionDays: 30,
+      maxBackups: 50,
+      autoBackupOnClose: false
+    };
+    return { ...defaults, ...get(KEYS.BACKUP_SETTINGS, {}) };
+  }
+
+  function saveBackupSettings(settings) {
+    const current = getBackupSettings();
+    return set(KEYS.BACKUP_SETTINGS, { ...current, ...settings });
+  }
+
+  function cleanupExpiredBackups() {
+    const settings = getBackupSettings();
+    if (!settings.autoCleanupEnabled) {
+      return { cleaned: 0, reason: '自动清理未启用' };
+    }
+
+    const history = getBackupHistory();
+    const now = Date.now();
+    const retentionMs = settings.retentionDays * 24 * 60 * 60 * 1000;
+
+    const remaining = [];
+    const cleaned = [];
+
+    history.forEach(b => {
+      const created = new Date(b.createdAt).getTime();
+      const age = now - created;
+      if (age <= retentionMs && remaining.length < settings.maxBackups) {
+        remaining.push(b);
+      } else {
+        cleaned.push(b);
+      }
+    });
+
+    if (remaining.length >= settings.maxBackups) {
+      const excess = remaining.length - settings.maxBackups;
+      if (excess > 0) {
+        const toRemove = remaining.splice(settings.maxBackups, excess);
+        cleaned.push(...toRemove);
+      }
+    }
+
+    saveBackupHistory(remaining);
+
+    return {
+      cleaned: cleaned.length,
+      cleanedIds: cleaned.map(b => b.id),
+      remaining: remaining.length
+    };
+  }
+
+  function filterBackupHistory(filters) {
+    let history = getBackupHistory();
+
+    if (filters) {
+      if (filters.keyword) {
+        const kw = filters.keyword.toLowerCase();
+        history = history.filter(b =>
+          (b.name && b.name.toLowerCase().includes(kw)) ||
+          (b.note && b.note.toLowerCase().includes(kw)) ||
+          (b.createdBy && b.createdBy.name && b.createdBy.name.toLowerCase().includes(kw))
+        );
+      }
+
+      if (filters.operatorName) {
+        history = history.filter(b =>
+          b.createdBy && b.createdBy.name === filters.operatorName
+        );
+      }
+
+      if (filters.operatorRole) {
+        history = history.filter(b =>
+          b.createdBy && b.createdBy.role === filters.operatorRole
+        );
+      }
+
+      if (filters.startDate) {
+        const start = new Date(filters.startDate).getTime();
+        history = history.filter(b => new Date(b.createdAt).getTime() >= start);
+      }
+
+      if (filters.endDate) {
+        const end = new Date(filters.endDate).getTime() + 24 * 60 * 60 * 1000;
+        history = history.filter(b => new Date(b.createdAt).getTime() < end);
+      }
+
+      if (filters.shiftStatus) {
+        history = history.filter(b => {
+          if (!b.summary) return false;
+          if (filters.shiftStatus === 'has_active') {
+            return b.summary.hasActiveShift === true;
+          }
+          if (filters.shiftStatus === 'closed_only') {
+            return b.summary.hasActiveShift === false;
+          }
+          return true;
+        });
+      }
+    }
+
+    return history;
+  }
+
   function resetAllData() {
     Object.values(KEYS).forEach(key => remove(key));
   }
@@ -612,6 +808,20 @@ const Storage = (function() {
     clearLastRestoreSnapshot,
     captureFullSnapshot,
     restoreFromSnapshot,
+    getBackupHistory,
+    saveBackupHistory,
+    addBackupToHistory,
+    updateBackupInfo,
+    deleteBackupFromHistory,
+    getBackupById,
+    getRestoreLock,
+    acquireRestoreLock,
+    releaseRestoreLock,
+    refreshRestoreLock,
+    getBackupSettings,
+    saveBackupSettings,
+    cleanupExpiredBackups,
+    filterBackupHistory,
     resetAllData
   };
 })();

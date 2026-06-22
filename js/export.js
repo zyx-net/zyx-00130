@@ -1045,8 +1045,534 @@ const ExportModule = (function() {
     };
   }
 
+  const DATA_BLOCKS = {
+    SHIFTS: 'shifts',
+    DRUGS: 'drugs',
+    INVENTORY: 'inventory',
+    DISCREPANCIES: 'discrepancies',
+    AUDIT_LOGS: 'auditLogs'
+  };
+
+  const DATA_BLOCK_LABELS = {
+    shifts: '班次数据',
+    drugs: '药品基础数据',
+    inventory: '盘点结果',
+    discrepancies: '差异与修正记录',
+    auditLogs: '审计日志'
+  };
+
+  function getAllDataBlocks() {
+    return Object.values(DATA_BLOCKS);
+  }
+
+  function getDataBlockLabel(block) {
+    return DATA_BLOCK_LABELS[block] || block;
+  }
+
+  function compareBackupWithCurrent(backup) {
+    const validation = validateBackup(backup);
+    if (!validation.valid) {
+      return { success: false, message: validation.reason };
+    }
+
+    const diff = {
+      shifts: {
+        backupCount: 0,
+        currentCount: 0,
+        newShiftNames: [],
+        modifiedShiftNames: [],
+        commonShiftNames: [],
+        backupHasActive: false,
+        currentHasActive: false
+      },
+      drugs: {
+        backupCount: 0,
+        currentCount: 0,
+        newDrugs: [],
+        modifiedDrugs: [],
+        deletedDrugs: [],
+        commonCount: 0
+      },
+      inventory: {
+        backupShiftCount: 0,
+        currentShiftCount: 0,
+        affectedShiftNames: [],
+        totalItemsBackup: 0,
+        totalItemsCurrent: 0,
+        countedItemsBackup: 0,
+        countedItemsCurrent: 0
+      },
+      discrepancies: {
+        backupShiftCount: 0,
+        currentShiftCount: 0,
+        backupTotal: 0,
+        currentTotal: 0,
+        backupPending: 0,
+        currentPending: 0,
+        backupResolved: 0,
+        currentResolved: 0
+      },
+      corrections: {
+        backupTotal: 0,
+        currentTotal: 0,
+        backupPending: 0,
+        currentPending: 0,
+        backupApproved: 0,
+        currentApproved: 0
+      },
+      auditLogs: {
+        backupCount: 0,
+        currentCount: 0,
+        willAddCount: 0
+      }
+    };
+
+    const currentShift = Storage.getCurrentShift();
+    const historyShifts = Storage.getShiftHistory();
+    const currentShifts = historyShifts.slice();
+    if (currentShift) currentShifts.push(currentShift);
+    const currentShiftNames = new Set(currentShifts.map(s => s.name));
+
+    const backupShifts = (backup.data.shiftHistory || []).slice();
+    if (backup.data.currentShift) backupShifts.push(backup.data.currentShift);
+    const backupShiftNames = new Set(backupShifts.map(s => s.name));
+
+    diff.shifts.backupCount = backupShifts.length;
+    diff.shifts.currentCount = currentShifts.length;
+    diff.shifts.backupHasActive = backupShifts.some(s => s.status && s.status !== 'closed');
+    diff.shifts.currentHasActive = currentShifts.some(s => s.status && s.status !== 'closed');
+
+    backupShiftNames.forEach(name => {
+      if (currentShiftNames.has(name)) {
+        diff.shifts.commonShiftNames.push(name);
+        const bk = backupShifts.find(s => s.name === name);
+        const cur = currentShifts.find(s => s.name === name);
+        if (bk && cur && JSON.stringify(bk.summary) !== JSON.stringify(cur.summary)) {
+          diff.shifts.modifiedShiftNames.push(name);
+        }
+      } else {
+        diff.shifts.newShiftNames.push(name);
+      }
+    });
+
+    const currentDrugs = Storage.getDrugs();
+    const backupDrugs = backup.data.drugs || [];
+    diff.drugs.backupCount = backupDrugs.length;
+    diff.drugs.currentCount = currentDrugs.length;
+
+    const currentDrugMap = {};
+    currentDrugs.forEach(d => { currentDrugMap[d.code] = d; });
+    const backupDrugMap = {};
+    backupDrugs.forEach(d => { backupDrugMap[d.code] = d; });
+
+    backupDrugs.forEach(d => {
+      if (!currentDrugMap[d.code]) {
+        diff.drugs.newDrugs.push({ code: d.code, name: d.name });
+      } else {
+        const cur = currentDrugMap[d.code];
+        const isModified = cur.name !== d.name || cur.spec !== d.spec ||
+          cur.initialStock !== d.initialStock || cur.type !== d.type;
+        if (isModified) {
+          diff.drugs.modifiedDrugs.push({
+            code: d.code,
+            backupName: d.name,
+            currentName: cur.name,
+            backupStock: d.initialStock,
+            currentStock: cur.initialStock
+          });
+        } else {
+          diff.drugs.commonCount++;
+        }
+      }
+    });
+
+    currentDrugs.forEach(d => {
+      if (!backupDrugMap[d.code]) {
+        diff.drugs.deletedDrugs.push({ code: d.code, name: d.name });
+      }
+    });
+
+    const backupInv = backup.data.inventory || {};
+    const currentInv = Storage.get(Storage.KEYS.INVENTORY, {});
+    diff.inventory.backupShiftCount = Object.keys(backupInv).length;
+    diff.inventory.currentShiftCount = Object.keys(currentInv).length;
+
+    Object.keys(backupInv).forEach(shiftId => {
+      const items = backupInv[shiftId] || [];
+      diff.inventory.totalItemsBackup += items.length;
+      diff.inventory.countedItemsBackup += items.filter(i => i.isCounted).length;
+    });
+    Object.keys(currentInv).forEach(shiftId => {
+      const items = currentInv[shiftId] || [];
+      diff.inventory.totalItemsCurrent += items.length;
+      diff.inventory.countedItemsCurrent += items.filter(i => i.isCounted).length;
+    });
+
+    const backupShiftIdToName = {};
+    backupShifts.forEach(s => { backupShiftIdToName[s.id] = s.name; });
+    Object.keys(backupInv).forEach(shiftId => {
+      const name = backupShiftIdToName[shiftId] || shiftId;
+      if (!diff.inventory.affectedShiftNames.includes(name)) {
+        diff.inventory.affectedShiftNames.push(name);
+      }
+    });
+
+    const backupDisc = backup.data.discrepancies || {};
+    const currentDisc = Storage.get(Storage.KEYS.DISCREPANCIES, {});
+    diff.discrepancies.backupShiftCount = Object.keys(backupDisc).length;
+    diff.discrepancies.currentShiftCount = Object.keys(currentDisc).length;
+
+    Object.values(backupDisc).forEach(list => {
+      diff.discrepancies.backupTotal += list.length;
+      diff.discrepancies.backupPending += list.filter(d => d.status === 'pending').length;
+      diff.discrepancies.backupResolved += list.filter(d => d.status === 'resolved').length;
+      list.forEach(d => {
+        if (d.corrections) {
+          diff.corrections.backupTotal += d.corrections.length;
+          diff.corrections.backupPending += d.corrections.filter(c => c.status === 'pending').length;
+          diff.corrections.backupApproved += d.corrections.filter(c => c.status === 'approved').length;
+        }
+      });
+    });
+
+    Object.values(currentDisc).forEach(list => {
+      diff.discrepancies.currentTotal += list.length;
+      diff.discrepancies.currentPending += list.filter(d => d.status === 'pending').length;
+      diff.discrepancies.currentResolved += list.filter(d => d.status === 'resolved').length;
+      list.forEach(d => {
+        if (d.corrections) {
+          diff.corrections.currentTotal += d.corrections.length;
+          diff.corrections.currentPending += d.corrections.filter(c => c.status === 'pending').length;
+          diff.corrections.currentApproved += d.corrections.filter(c => c.status === 'approved').length;
+        }
+      });
+    });
+
+    const backupLogs = backup.data.auditLogs || [];
+    const currentLogs = Storage.getAuditLogs();
+    diff.auditLogs.backupCount = backupLogs.length;
+    diff.auditLogs.currentCount = currentLogs.length;
+
+    const currentLogIds = new Set(currentLogs.map(l => l.id));
+    diff.auditLogs.willAddCount = backupLogs.filter(l => l.id && !currentLogIds.has(l.id)).length;
+
+    return { success: true, diff: diff };
+  }
+
+  function generateDiffSummaryText(diffResult) {
+    if (!diffResult || !diffResult.success) return '';
+    const d = diffResult.diff;
+
+    const lines = [];
+    lines.push('【班次对比】');
+    lines.push(`  备份 ${d.shifts.backupCount} 个 / 本地 ${d.shifts.currentCount} 个`);
+    if (d.shifts.newShiftNames.length > 0) {
+      lines.push(`  备份新增班次 (${d.shifts.newShiftNames.length})：${d.shifts.newShiftNames.slice(0, 3).join('、')}${d.shifts.newShiftNames.length > 3 ? '...' : ''}`);
+    }
+    if (d.shifts.modifiedShiftNames.length > 0) {
+      lines.push(`  内容有差异的班次 (${d.shifts.modifiedShiftNames.length})：${d.shifts.modifiedShiftNames.slice(0, 3).join('、')}${d.shifts.modifiedShiftNames.length > 3 ? '...' : ''}`);
+    }
+
+    lines.push('【药品对比】');
+    lines.push(`  备份 ${d.drugs.backupCount} 种 / 本地 ${d.drugs.currentCount} 种`);
+    if (d.drugs.newDrugs.length > 0) lines.push(`  备份新增：${d.drugs.newDrugs.length} 种`);
+    if (d.drugs.modifiedDrugs.length > 0) lines.push(`  内容变更：${d.drugs.modifiedDrugs.length} 种`);
+    if (d.drugs.deletedDrugs.length > 0) lines.push(`  本地有但备份没有：${d.drugs.deletedDrugs.length} 种`);
+
+    lines.push('【盘点结果对比】');
+    lines.push(`  备份覆盖 ${d.inventory.backupShiftCount} 个班次 / 本地 ${d.inventory.currentShiftCount} 个`);
+    lines.push(`  已盘点条目：备份 ${d.inventory.countedItemsBackup} / 本地 ${d.inventory.countedItemsCurrent}`);
+
+    lines.push('【差异与修正记录对比】');
+    lines.push(`  差异总数：备份 ${d.discrepancies.backupTotal} / 本地 ${d.discrepancies.currentTotal}`);
+    lines.push(`  待处理差异：备份 ${d.discrepancies.backupPending} / 本地 ${d.discrepancies.currentPending}`);
+    lines.push(`  修正申请总数：备份 ${d.corrections.backupTotal} / 本地 ${d.corrections.currentTotal}`);
+    lines.push(`  待审批修正：备份 ${d.corrections.backupPending} / 本地 ${d.corrections.currentPending}`);
+
+    lines.push('【审计日志对比】');
+    lines.push(`  备份 ${d.auditLogs.backupCount} 条 / 本地 ${d.auditLogs.currentCount} 条（将新增 ${d.auditLogs.willAddCount} 条）`);
+
+    return lines.join('\n');
+  }
+
+  function detectBusinessConflicts() {
+    const conflicts = {
+      hasActiveShift: false,
+      activeShiftName: null,
+      hasUncountedInventory: false,
+      uncountedCount: 0,
+      hasPendingCorrections: false,
+      pendingCorrectionCount: 0,
+      hasPendingControlledDiscrepancies: false,
+      pendingControlledCount: 0,
+      warnings: []
+    };
+
+    const currentShift = Storage.getCurrentShift();
+    if (currentShift && currentShift.status !== 'closed') {
+      conflicts.hasActiveShift = true;
+      conflicts.activeShiftName = currentShift.name;
+      conflicts.warnings.push(`当前有进行中的班次「${currentShift.name}」，恢复可能覆盖在途数据`);
+    }
+
+    if (currentShift) {
+      const inv = Storage.getInventory(currentShift.id);
+      const uncounted = inv.filter(i => !i.isCounted);
+      if (uncounted.length > 0) {
+        conflicts.hasUncountedInventory = true;
+        conflicts.uncountedCount = uncounted.length;
+        conflicts.warnings.push(`当前班次有 ${uncounted.length} 种药品未完成盘点`);
+      }
+    }
+
+    if (currentShift) {
+      const discs = Storage.getDiscrepancies(currentShift.id);
+      let pendingCorr = 0;
+      let pendingControlled = 0;
+      discs.forEach(d => {
+        if (d.status === 'pending' && d.drugType === 'controlled') {
+          pendingControlled++;
+        }
+        if (d.corrections) {
+          pendingCorr += d.corrections.filter(c => c.status === 'pending').length;
+        }
+      });
+      if (pendingCorr > 0) {
+        conflicts.hasPendingCorrections = true;
+        conflicts.pendingCorrectionCount = pendingCorr;
+        conflicts.warnings.push(`当前有 ${pendingCorr} 项待审批修正申请`);
+      }
+      if (pendingControlled > 0) {
+        conflicts.hasPendingControlledDiscrepancies = true;
+        conflicts.pendingControlledCount = pendingControlled;
+        conflicts.warnings.push(`当前有 ${pendingControlled} 项待处理的受控药品差异`);
+      }
+    }
+
+    conflicts.hasConflicts = conflicts.warnings.length > 0;
+    return conflicts;
+  }
+
+  function createBackupWithInfo(name, note) {
+    const user = Auth.getCurrentUser();
+    const backup = createBackup();
+
+    const currentShift = backup.data.currentShift;
+    const history = backup.data.shiftHistory || [];
+    const allShifts = history.slice();
+    if (currentShift) allShifts.push(currentShift);
+
+    const invMap = backup.data.inventory || {};
+    const discMap = backup.data.discrepancies || {};
+
+    let totalDiscrepancies = 0;
+    let totalCorrections = 0;
+    let pendingCorrections = 0;
+    Object.values(discMap).forEach(list => {
+      totalDiscrepancies += list.length;
+      list.forEach(d => {
+        if (d.corrections) {
+          totalCorrections += d.corrections.length;
+          pendingCorrections += d.corrections.filter(c => c.status === 'pending').length;
+        }
+      });
+    });
+
+    const summary = {
+      shiftCount: allShifts.length,
+      hasActiveShift: allShifts.some(s => s.status && s.status !== 'closed'),
+      activeShiftName: currentShift ? currentShift.name : null,
+      drugCount: (backup.data.drugs || []).length,
+      inventoryShiftCount: Object.keys(invMap).length,
+      totalInventoryItems: Object.values(invMap).reduce((sum, arr) => sum + arr.length, 0),
+      totalDiscrepancies: totalDiscrepancies,
+      totalCorrections: totalCorrections,
+      pendingCorrections: pendingCorrections,
+      auditLogCount: (backup.data.auditLogs || []).length
+    };
+
+    const backupInfo = Storage.addBackupToHistory({
+      name: name || '',
+      note: note || '',
+      version: backup.version,
+      exportedAt: backup.exportedAt,
+      exportedAtFormatted: backup.exportedAtFormatted,
+      createdBy: user ? { id: user.id, name: user.name, role: user.role } : null,
+      summary: summary,
+      backupData: backup
+    });
+
+    Storage.cleanupExpiredBackups();
+
+    Storage.addAuditLog(
+      '创建本地备份',
+      `创建备份「${backupInfo.name || '未命名'}」，包含${summary.shiftCount}个班次、${summary.drugCount}种药品`,
+      user
+    );
+
+    return { success: true, backupInfo: backupInfo, backup: backup };
+  }
+
+  function applyPartialBackup(backup, dataBlocks, conflictResolutions) {
+    const user = Auth.getCurrentUser();
+    if (!user) {
+      return { success: false, message: '请先登录后再导入数据' };
+    }
+    if (!Auth.canPerformPartialRestore()) {
+      return { success: false, message: '只有药师可以执行部分数据恢复操作' };
+    }
+
+    const validation = validateBackup(backup);
+    if (!validation.valid) {
+      return { success: false, message: validation.reason };
+    }
+
+    if (!dataBlocks || dataBlocks.length === 0) {
+      return { success: false, message: '请至少选择一个数据块进行恢复' };
+    }
+
+    const invalidBlocks = dataBlocks.filter(b => !Object.values(DATA_BLOCKS).includes(b));
+    if (invalidBlocks.length > 0) {
+      return { success: false, message: `无效的数据块：${invalidBlocks.join('、')}` };
+    }
+
+    const lockResult = Storage.acquireRestoreLock(user);
+    if (!lockResult.success) {
+      return { success: false, message: lockResult.reason || '获取恢复锁失败' };
+    }
+
+    let rollbackSnapshot = null;
+    try {
+      rollbackSnapshot = Storage.captureFullSnapshot();
+      Storage.saveLastRestoreSnapshot(rollbackSnapshot);
+
+      const businessConflicts = detectBusinessConflicts();
+      if (businessConflicts.hasConflicts) {
+        Storage.releaseRestoreLock();
+        Storage.clearLastRestoreSnapshot();
+        return {
+          success: false,
+          message: '检测到业务冲突，请先处理后再恢复',
+          businessConflicts: businessConflicts
+        };
+      }
+
+      const filteredBackup = deepCloneObj(backup);
+
+      if (!dataBlocks.includes(DATA_BLOCKS.SHIFTS)) {
+        filteredBackup.data.currentShift = null;
+        filteredBackup.data.shiftHistory = [];
+      }
+      if (!dataBlocks.includes(DATA_BLOCKS.DRUGS)) {
+        filteredBackup.data.drugs = Storage.getDrugs();
+      }
+      if (!dataBlocks.includes(DATA_BLOCKS.INVENTORY)) {
+        filteredBackup.data.inventory = Storage.get(Storage.KEYS.INVENTORY, {});
+      }
+      if (!dataBlocks.includes(DATA_BLOCKS.DISCREPANCIES)) {
+        filteredBackup.data.discrepancies = Storage.get(Storage.KEYS.DISCREPANCIES, {});
+      }
+      if (!dataBlocks.includes(DATA_BLOCKS.AUDIT_LOGS)) {
+        filteredBackup.data.auditLogs = [];
+      }
+
+      const preview = preRestorePreview(filteredBackup, conflictResolutions || []);
+
+      const result = originalApplyBackup(filteredBackup, conflictResolutions || []);
+
+      if (result.success) {
+        const record = Storage.addRestoreRecord({
+          backupVersion: backup.version,
+          backupExportedAt: backup.exportedAt,
+          backupExportedAtFormatted: backup.exportedAtFormatted,
+          backupExportedBy: backup.exportedBy || null,
+          restoredBy: { id: user.id, name: user.name, role: user.role },
+          isPartial: true,
+          dataBlocks: dataBlocks,
+          conflictResolutions: (conflictResolutions || []).map(r => ({
+            type: r.conflict.type,
+            target: r.conflict.importedName || r.conflict.drugCode || (r.conflict.importedShiftId + '_' + r.conflict.correction.requestedAt),
+            strategy: r.strategy,
+            description: r.description
+          })),
+          previewSummary: preview.success ? preview.summary : null,
+          results: result.results,
+          status: 'success',
+          undone: false
+        });
+
+        result.restoreRecordId = record.id;
+        result.restoreRecord = record;
+        result.isPartial = true;
+        result.dataBlocks = dataBlocks;
+
+        Storage.addAuditLog(
+          '部分数据恢复',
+          `恢复 ${dataBlocks.map(b => getDataBlockLabel(b)).join('、')}，记录ID: ${record.id}`,
+          user
+        );
+      } else {
+        throw new Error(result.message || '恢复失败');
+      }
+
+      Storage.releaseRestoreLock();
+      return result;
+
+    } catch (e) {
+      if (rollbackSnapshot) {
+        const rollbackOk = Storage.restoreFromSnapshot(rollbackSnapshot);
+        if (rollbackOk) {
+          Storage.clearLastRestoreSnapshot();
+        }
+      }
+      Storage.releaseRestoreLock();
+
+      Storage.addRestoreRecord({
+        backupVersion: backup.version,
+        backupExportedAt: backup.exportedAt,
+        backupExportedAtFormatted: backup.exportedAtFormatted,
+        backupExportedBy: backup.exportedBy || null,
+        restoredBy: { id: user.id, name: user.name, role: user.role },
+        isPartial: true,
+        dataBlocks: dataBlocks,
+        status: 'failed',
+        errorMessage: e.message,
+        undone: true
+      });
+
+      Storage.addAuditLog(
+        '部分数据恢复失败',
+        `恢复失败：${e.message}，数据已回滚`,
+        user
+      );
+
+      return {
+        success: false,
+        message: '恢复失败，数据已回滚：' + e.message,
+        error: e.message,
+        rolledBack: true
+      };
+    }
+  }
+
   function getRestoreRecords() {
     return Storage.getRestoreRecords();
+  }
+
+  function getLastRestoreInfo() {
+    const records = Storage.getRestoreRecords();
+    if (records.length === 0) return null;
+
+    const last = records[0];
+    const snapshot = Storage.getLastRestoreSnapshot();
+    const lock = Storage.getRestoreLock();
+
+    return {
+      record: last,
+      hasUndoableSnapshot: !!snapshot && !last.undone,
+      hasActiveLock: !!lock,
+      lock: lock
+    };
   }
 
   function undoLastRestore() {
@@ -1098,6 +1624,7 @@ const ExportModule = (function() {
   }
 
   const originalApplyBackup = applyBackup;
+
   function applyBackupWithTracking(backup, conflictResolutions) {
     const user = Auth.getCurrentUser();
     if (!user) {
@@ -1112,45 +1639,148 @@ const ExportModule = (function() {
       return { success: false, message: validation.reason };
     }
 
-    const snapshot = Storage.captureFullSnapshot();
-    Storage.saveLastRestoreSnapshot(snapshot);
+    const lockResult = Storage.acquireRestoreLock(user);
+    if (!lockResult.success) {
+      return { success: false, message: lockResult.reason || '获取恢复锁失败' };
+    }
 
-    const preview = preRestorePreview(backup, conflictResolutions || []);
+    let rollbackSnapshot = null;
+    try {
+      rollbackSnapshot = Storage.captureFullSnapshot();
+      Storage.saveLastRestoreSnapshot(rollbackSnapshot);
 
-    const result = originalApplyBackup(backup, conflictResolutions || []);
+      const businessConflicts = detectBusinessConflicts();
+      if (businessConflicts.hasConflicts) {
+        Storage.releaseRestoreLock();
+        Storage.clearLastRestoreSnapshot();
+        return {
+          success: false,
+          message: '检测到业务冲突，请先处理后再恢复',
+          businessConflicts: businessConflicts
+        };
+      }
 
-    if (result.success) {
-      const record = Storage.addRestoreRecord({
+      const preview = preRestorePreview(backup, conflictResolutions || []);
+
+      const result = originalApplyBackup(backup, conflictResolutions || []);
+
+      if (result.success) {
+        const record = Storage.addRestoreRecord({
+          backupVersion: backup.version,
+          backupExportedAt: backup.exportedAt,
+          backupExportedAtFormatted: backup.exportedAtFormatted,
+          backupExportedBy: backup.exportedBy || null,
+          restoredBy: { id: user.id, name: user.name, role: user.role },
+          isPartial: false,
+          dataBlocks: getAllDataBlocks(),
+          conflictResolutions: (conflictResolutions || []).map(r => ({
+            type: r.conflict.type,
+            target: r.conflict.importedName || r.conflict.drugCode || (r.conflict.importedShiftId + '_' + r.conflict.correction.requestedAt),
+            strategy: r.strategy,
+            description: r.description
+          })),
+          previewSummary: preview.success ? preview.summary : null,
+          results: result.results,
+          status: 'success',
+          undone: false
+        });
+
+        result.restoreRecordId = record.id;
+        result.restoreRecord = record;
+        result.isPartial = false;
+
+        const logs = Storage.getAuditLogs();
+        const restoreLog = logs.find(l => l.action === '导入数据备份');
+        if (restoreLog) {
+          restoreLog.details += `；恢复记录ID: ${record.id}`;
+          Storage.set(Storage.KEYS.AUDIT_LOGS, logs);
+        }
+      } else {
+        throw new Error(result.message || '恢复失败');
+      }
+
+      Storage.releaseRestoreLock();
+      return result;
+
+    } catch (e) {
+      if (rollbackSnapshot) {
+        const rollbackOk = Storage.restoreFromSnapshot(rollbackSnapshot);
+        if (rollbackOk) {
+          Storage.clearLastRestoreSnapshot();
+        }
+      }
+      Storage.releaseRestoreLock();
+
+      Storage.addRestoreRecord({
         backupVersion: backup.version,
         backupExportedAt: backup.exportedAt,
         backupExportedAtFormatted: backup.exportedAtFormatted,
         backupExportedBy: backup.exportedBy || null,
         restoredBy: { id: user.id, name: user.name, role: user.role },
-        conflictResolutions: (conflictResolutions || []).map(r => ({
-          type: r.conflict.type,
-          target: r.conflict.importedName || r.conflict.drugCode || (r.conflict.importedShiftId + '_' + r.conflict.correction.requestedAt),
-          strategy: r.strategy,
-          description: r.description
-        })),
-        previewSummary: preview.success ? preview.summary : null,
-        results: result.results,
-        undone: false
+        isPartial: false,
+        dataBlocks: getAllDataBlocks(),
+        status: 'failed',
+        errorMessage: e.message,
+        undone: true
       });
 
-      result.restoreRecordId = record.id;
-      result.restoreRecord = record;
+      Storage.addAuditLog(
+        '完整数据恢复失败',
+        `恢复失败：${e.message}，数据已回滚`,
+        user
+      );
 
-      const logs = Storage.getAuditLogs();
-      const restoreLog = logs.find(l => l.action === '导入数据备份');
-      if (restoreLog) {
-        restoreLog.details += `；恢复记录ID: ${record.id}`;
-        Storage.set(Storage.KEYS.AUDIT_LOGS, logs);
-      }
-    } else {
-      Storage.clearLastRestoreSnapshot();
+      return {
+        success: false,
+        message: '恢复失败，数据已回滚：' + e.message,
+        error: e.message,
+        rolledBack: true
+      };
+    }
+  }
+
+  function prePartialRestorePreview(backup, dataBlocks, conflictResolutions) {
+    const validation = validateBackup(backup);
+    if (!validation.valid) {
+      return { success: false, message: validation.reason };
     }
 
-    return result;
+    if (!dataBlocks || dataBlocks.length === 0) {
+      return { success: false, message: '请至少选择一个数据块' };
+    }
+
+    const filteredBackup = deepCloneObj(backup);
+
+    if (!dataBlocks.includes(DATA_BLOCKS.SHIFTS)) {
+      filteredBackup.data.currentShift = null;
+      filteredBackup.data.shiftHistory = [];
+    }
+    if (!dataBlocks.includes(DATA_BLOCKS.DRUGS)) {
+      filteredBackup.data.drugs = Storage.getDrugs();
+    }
+    if (!dataBlocks.includes(DATA_BLOCKS.INVENTORY)) {
+      filteredBackup.data.inventory = Storage.get(Storage.KEYS.INVENTORY, {});
+    }
+    if (!dataBlocks.includes(DATA_BLOCKS.DISCREPANCIES)) {
+      filteredBackup.data.discrepancies = Storage.get(Storage.KEYS.DISCREPANCIES, {});
+    }
+    if (!dataBlocks.includes(DATA_BLOCKS.AUDIT_LOGS)) {
+      filteredBackup.data.auditLogs = [];
+    }
+
+    const preview = preRestorePreview(filteredBackup, conflictResolutions || []);
+    const diff = compareBackupWithCurrent(backup);
+
+    return {
+      success: true,
+      preview: preview.success ? preview.preview : null,
+      summary: preview.success ? preview.summary : null,
+      summaryText: preview.success ? preview.summaryText : '',
+      diff: diff.success ? diff.diff : null,
+      diffSummaryText: generateDiffSummaryText(diff),
+      dataBlocks: dataBlocks,
+      dataBlockLabels: dataBlocks.map(b => getDataBlockLabel(b))
+    };
   }
 
   return {
@@ -1169,6 +1799,16 @@ const ExportModule = (function() {
     sanitizeAuditLogsForImport,
     preRestorePreview,
     undoLastRestore,
-    getRestoreRecords
+    getRestoreRecords,
+    DATA_BLOCKS,
+    getAllDataBlocks,
+    getDataBlockLabel,
+    compareBackupWithCurrent,
+    generateDiffSummaryText,
+    detectBusinessConflicts,
+    createBackupWithInfo,
+    applyPartialBackup,
+    prePartialRestorePreview,
+    getLastRestoreInfo
   };
 })();

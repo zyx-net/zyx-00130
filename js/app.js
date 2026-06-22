@@ -1,6 +1,18 @@
 const App = (function() {
   let currentTab = 'dashboard';
   let inventoryFilter = 'all';
+  let backupSubTab = 'history';
+  let backupFilters = {
+    keyword: '',
+    operatorRole: '',
+    shiftStatus: '',
+    startDate: '',
+    endDate: ''
+  };
+  let selectedBackupId = null;
+  let selectedDataBlocks = [];
+  let backupPendingPreview = null;
+  let backupPendingConflicts = null;
 
   function init() {
     Storage.initializeDemoData();
@@ -111,6 +123,9 @@ const App = (function() {
     }
     tabs.push({ key: 'history', label: '历史班次' });
     tabs.push({ key: 'audit', label: '审计日志' });
+    if (Auth.canViewRestoreRecords()) {
+      tabs.push({ key: 'backup', label: '备份中心' });
+    }
 
     main.innerHTML = `
       <div class="nav-tabs">
@@ -148,6 +163,9 @@ const App = (function() {
         break;
       case 'audit':
         renderAuditLog(content);
+        break;
+      case 'backup':
+        renderBackupCenter(content);
         break;
       default:
         renderDashboard(content);
@@ -770,6 +788,677 @@ const App = (function() {
     `;
   }
 
+  function renderBackupCenter(container) {
+    const user = Auth.getCurrentUser();
+    const isPharmacist = Auth.isPharmacist();
+    const canManage = Auth.canManageBackups();
+
+    container.innerHTML = `
+      <div class="backup-center">
+        <div class="backup-subtabs">
+          <div class="backup-subtab ${backupSubTab === 'history' ? 'active' : ''}"
+               onclick="App.switchBackupSubTab('history')">
+            📦 备份历史
+          </div>
+          <div class="backup-subtab ${backupSubTab === 'records' ? 'active' : ''}"
+               onclick="App.switchBackupSubTab('records')">
+            📋 恢复记录
+          </div>
+          ${isPharmacist ? `
+            <div class="backup-subtab ${backupSubTab === 'settings' ? 'active' : ''}"
+                 onclick="App.switchBackupSubTab('settings')">
+              ⚙️ 备份设置
+            </div>
+          ` : ''}
+        </div>
+        <div id="backup-subtab-content"></div>
+      </div>
+    `;
+
+    const subContent = document.getElementById('backup-subtab-content');
+    switch (backupSubTab) {
+      case 'history':
+        renderBackupHistory(subContent);
+        break;
+      case 'records':
+        renderRestoreRecordsView(subContent);
+        break;
+      case 'settings':
+        renderBackupSettings(subContent);
+        break;
+    }
+  }
+
+  function switchBackupSubTab(tab) {
+    backupSubTab = tab;
+    selectedBackupId = null;
+    renderBackupCenter(document.getElementById('tab-content'));
+  }
+
+  function renderBackupHistory(container) {
+    const user = Auth.getCurrentUser();
+    const isPharmacist = Auth.isPharmacist();
+    const filtered = Storage.filterBackupHistory(backupFilters);
+    const lastRestore = ExportModule.getLastRestoreInfo();
+
+    container.innerHTML = `
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+          <h3 style="margin:0;">备份历史</h3>
+          <div style="display:flex; gap:8px;">
+            ${isPharmacist ? `
+              <button class="btn btn-primary btn-sm" onclick="App.showCreateBackupModal()">
+                + 创建备份
+              </button>
+              <button class="btn btn-default btn-sm" onclick="App.showImportBackupModal()">
+                📥 导入备份
+              </button>
+            ` : ''}
+          </div>
+        </div>
+
+        ${lastRestore && lastRestore.record ? `
+          <div class="alert alert-info" style="margin-bottom:16px;">
+            <strong>最近恢复：</strong>
+            ${lastRestore.record.timestampFormatted}
+            由 ${lastRestore.record.restoredBy ? lastRestore.record.restoredBy.name : '未知'}
+            (${lastRestore.record.isPartial ? '部分恢复' : '完整恢复'})
+            - ${lastRestore.record.status === 'success'
+                ? (lastRestore.record.undone ? '已撤回' : '已生效')
+                : '失败: ' + (lastRestore.record.errorMessage || '未知错误')}
+            ${lastRestore.hasUndoableSnapshot ? `
+              <button class="btn btn-warning btn-sm" style="margin-left:8px;" onclick="App.handleUndoRestore()">
+                撤回恢复
+              </button>
+            ` : ''}
+          </div>
+        ` : ''}
+
+        <div class="backup-filter-bar">
+          <input type="text" class="backup-filter-input"
+                 placeholder="🔍 搜索备份名称、备注、操作人..."
+                 value="${backupFilters.keyword}"
+                 oninput="App.filterBackups('keyword', this.value)">
+          <select class="backup-filter-select" onchange="App.filterBackups('operatorRole', this.value)">
+            <option value="">全部角色</option>
+            <option value="pharmacist" ${backupFilters.operatorRole === 'pharmacist' ? 'selected' : ''}>药师</option>
+            <option value="nurse" ${backupFilters.operatorRole === 'nurse' ? 'selected' : ''}>护士</option>
+          </select>
+          <select class="backup-filter-select" onchange="App.filterBackups('shiftStatus', this.value)">
+            <option value="">全部班次状态</option>
+            <option value="has_active" ${backupFilters.shiftStatus === 'has_active' ? 'selected' : ''}>含进行中班次</option>
+            <option value="closed_only" ${backupFilters.shiftStatus === 'closed_only' ? 'selected' : ''}>仅已关闭班次</option>
+          </select>
+          <input type="date" class="backup-filter-input"
+                 placeholder="开始日期"
+                 value="${backupFilters.startDate}"
+                 onchange="App.filterBackups('startDate', this.value)">
+          <input type="date" class="backup-filter-input"
+                 placeholder="结束日期"
+                 value="${backupFilters.endDate}"
+                 onchange="App.filterBackups('endDate', this.value)">
+          <button class="btn btn-default btn-sm" onclick="App.clearBackupFilters()">重置</button>
+        </div>
+
+        <p style="font-size:12px; color:#8c8c8c; margin:12px 0;">
+          共 ${filtered.length} 条备份记录
+        </p>
+
+        <div class="backup-list">
+          ${filtered.length === 0 ? `
+            <div class="empty-state">暂无备份记录</div>
+          ` : filtered.map(b => renderBackupItem(b)).join('')}
+        </div>
+      </div>
+
+      <div id="backup-detail-modal"></div>
+    `;
+  }
+
+  function renderBackupItem(backup) {
+    const isSelected = selectedBackupId === backup.id;
+    const summary = backup.summary || {};
+
+    return `
+      <div class="backup-item ${isSelected ? 'selected' : ''}"
+           onclick="App.viewBackupDetail('${backup.id}')">
+        <div class="backup-item-header">
+          <span class="backup-item-name">
+            ${backup.name || '未命名备份'}
+            ${summary.hasActiveShift
+              ? '<span class="status-badge status-active" style="margin-left:8px; font-size:10px;">进行中</span>'
+              : '<span class="status-badge status-closed" style="margin-left:8px; font-size:10px;">已关班</span>'}
+          </span>
+          <span class="backup-item-date">${backup.createdAtFormatted}</span>
+        </div>
+        <div class="backup-item-meta">
+          <span>操作人：${backup.createdBy ? backup.createdBy.name : '未知'}</span>
+          <span>班次：${summary.shiftCount || 0} 个</span>
+          <span>药品：${summary.drugCount || 0} 种</span>
+          <span>盘点：${summary.totalInventoryItems || 0} 条</span>
+        </div>
+        ${backup.note ? `<div class="backup-item-note">📝 ${backup.note}</div>` : ''}
+      </div>
+    `;
+  }
+
+  function filterBackups(key, value) {
+    backupFilters[key] = value;
+    renderBackupHistory(document.getElementById('backup-subtab-content'));
+  }
+
+  function clearBackupFilters() {
+    backupFilters = {
+      keyword: '',
+      operatorRole: '',
+      shiftStatus: '',
+      startDate: '',
+      endDate: ''
+    };
+    renderBackupHistory(document.getElementById('backup-subtab-content'));
+  }
+
+  function showCreateBackupModal() {
+    if (!Auth.canManageBackups()) {
+      alert('只有药师可以创建备份');
+      return;
+    }
+
+    const modal = document.createElement('div');
+    modal.className = 'modal-overlay';
+    modal.id = 'create-backup-modal';
+    modal.innerHTML = `
+      <div class="modal">
+        <h3>创建本地备份</h3>
+        <div class="form-group">
+          <label>备份名称</label>
+          <input type="text" id="backup-name-input" placeholder="例如：中班交接前备份">
+        </div>
+        <div class="form-group">
+          <label>备注（可选）</label>
+          <textarea id="backup-note-input" rows="3" placeholder="记录备份原因或特殊说明"></textarea>
+        </div>
+        <div class="alert alert-info" style="font-size:12px; margin-bottom:16px;">
+          备份将保存到本地浏览器存储中，包含全部班次、盘点、差异、修正和审计日志数据。
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-default" onclick="document.getElementById('create-backup-modal').remove()">取消</button>
+          <button class="btn btn-primary" onclick="App.handleCreateBackup()">确认创建</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+  }
+
+  function handleCreateBackup() {
+    const name = document.getElementById('backup-name-input').value.trim();
+    const note = document.getElementById('backup-note-input').value.trim();
+
+    const result = ExportModule.createBackupWithInfo(name, note);
+    if (result.success) {
+      alert('✅ 备份创建成功！');
+      document.getElementById('create-backup-modal').remove();
+      renderBackupCenter(document.getElementById('tab-content'));
+    } else {
+      alert('创建失败：' + result.message);
+    }
+  }
+
+  function viewBackupDetail(backupId) {
+    selectedBackupId = backupId;
+    const backupInfo = Storage.getBackupById(backupId);
+    if (!backupInfo || !backupInfo.backupData) {
+      alert('备份数据不存在或已损坏');
+      return;
+    }
+
+    const diffResult = ExportModule.compareBackupWithCurrent(backupInfo.backupData);
+    const diffText = ExportModule.generateDiffSummaryText(diffResult);
+    const isPharmacist = Auth.isPharmacist();
+    const allBlocks = ExportModule.getAllDataBlocks();
+
+    if (selectedDataBlocks.length === 0) {
+      selectedDataBlocks = allBlocks.slice();
+    }
+
+    const modal = document.getElementById('backup-detail-modal');
+    modal.innerHTML = `
+      <div class="modal-overlay" style="z-index:1000;">
+        <div class="modal" style="max-width:700px; max-height:85vh; overflow-y:auto;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+            <h3 style="margin:0;">备份详情 - ${backupInfo.name || '未命名备份'}</h3>
+            <button class="btn btn-default btn-sm" onclick="App.closeBackupDetail()">关闭</button>
+          </div>
+
+          <div class="backup-detail-section">
+            <p style="font-size:12px; color:#8c8c8c;">
+              创建时间：${backupInfo.createdAtFormatted} |
+              操作人：${backupInfo.createdBy ? backupInfo.createdBy.name : '未知'} |
+              版本：${backupInfo.version || '-'}
+            </p>
+            ${backupInfo.note ? `<p style="font-size:13px;"><strong>备注：</strong>${backupInfo.note}</p>` : ''}
+          </div>
+
+          <div class="backup-detail-section">
+            <h4 style="margin:0 0 8px 0; color:#1890ff;">📊 与当前数据差异对比</h4>
+            <pre style="background:#f6ffed; padding:12px; border-radius:4px; font-size:12px; white-space:pre-wrap; margin:0;">${diffText || '暂无差异数据'}</pre>
+          </div>
+
+          ${isPharmacist ? `
+            <div class="backup-detail-section">
+              <h4 style="margin:0 0 8px 0; color:#faad14;">🎯 选择恢复的数据块</h4>
+              <p style="font-size:12px; color:#8c8c8c; margin-bottom:8px;">
+                取消勾选可只恢复部分数据，避免整包覆盖
+              </p>
+              <div style="display:flex; flex-direction:column; gap:6px;">
+                ${allBlocks.map(block => `
+                  <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
+                    <input type="checkbox"
+                           ${selectedDataBlocks.includes(block) ? 'checked' : ''}
+                           onchange="App.toggleDataBlock('${block}', this.checked)">
+                    ${ExportModule.getDataBlockLabel(block)}
+                  </label>
+                `).join('')}
+              </div>
+              <div style="margin-top:10px;">
+                <button class="btn btn-default btn-sm" onclick="App.selectAllDataBlocks(true)">全选</button>
+                <button class="btn btn-default btn-sm" onclick="App.selectAllDataBlocks(false)">全不选</button>
+              </div>
+            </div>
+
+            <div class="backup-detail-section">
+              <h4 style="margin:0 0 8px 0; color:#52c41a;">👁 预演恢复</h4>
+              <button class="btn btn-info btn-sm" onclick="App.previewBackupRestore()">
+                计算预演结果
+              </button>
+              <div id="backup-preview-area" style="margin-top:8px;"></div>
+            </div>
+
+            <div class="alert alert-warning" style="font-size:12px; margin:16px 0;">
+              ⚠️ <strong>重要提示：</strong>
+              恢复前请确保当前没有进行中的盘点、待审批修正或未关班的班次。
+              恢复操作将先锁定系统，执行失败会自动回滚。
+            </div>
+
+            <div class="modal-actions">
+              <button class="btn btn-default" onclick="App.closeBackupDetail()">取消</button>
+              <button class="btn btn-success" onclick="App.applyBackupRestore()">
+                确认恢复 (${selectedDataBlocks.length}/${allBlocks.length} 个数据块)
+              </button>
+            </div>
+          ` : `
+            <div class="alert alert-info" style="font-size:12px; margin:16px 0;">
+              护士账号可查看备份详情，恢复操作需药师权限。
+            </div>
+          `}
+        </div>
+      </div>
+    `;
+
+    renderBackupHistory(document.getElementById('backup-subtab-content'));
+  }
+
+  function closeBackupDetail() {
+    const modal = document.getElementById('backup-detail-modal');
+    if (modal) modal.innerHTML = '';
+    selectedBackupId = null;
+    selectedDataBlocks = [];
+    backupPendingPreview = null;
+    renderBackupHistory(document.getElementById('backup-subtab-content'));
+  }
+
+  function toggleDataBlock(block, checked) {
+    if (checked) {
+      if (!selectedDataBlocks.includes(block)) {
+        selectedDataBlocks.push(block);
+      }
+    } else {
+      selectedDataBlocks = selectedDataBlocks.filter(b => b !== block);
+    }
+    viewBackupDetail(selectedBackupId);
+  }
+
+  function selectAllDataBlocks(selectAll) {
+    if (selectAll) {
+      selectedDataBlocks = ExportModule.getAllDataBlocks();
+    } else {
+      selectedDataBlocks = [];
+    }
+    viewBackupDetail(selectedBackupId);
+  }
+
+  function previewBackupRestore() {
+    const backupInfo = Storage.getBackupById(selectedBackupId);
+    if (!backupInfo || !backupInfo.backupData) return;
+
+    const result = ExportModule.prePartialRestorePreview(
+      backupInfo.backupData,
+      selectedDataBlocks,
+      []
+    );
+
+    const area = document.getElementById('backup-preview-area');
+    if (result.success) {
+      area.innerHTML = `
+        <div style="padding:10px; background:#e6f7ff; border:1px solid #91d5ff; border-radius:4px; font-size:12px;">
+          <p style="margin:0 0 6px 0;"><strong>预演结果：</strong></p>
+          <p style="margin:0; color:#1890ff;">${result.summaryText}</p>
+          <p style="margin:6px 0 0 0; color:#595959; font-size:11px;">
+            选中数据块：${result.dataBlockLabels.join('、')}
+          </p>
+        </div>
+      `;
+    } else {
+      area.innerHTML = `<div class="alert alert-error" style="font-size:12px;">${result.message}</div>`;
+    }
+  }
+
+  function applyBackupRestore() {
+    if (!confirm('确认执行恢复？此操作将用备份数据覆盖所选数据块。\n\n恢复失败会自动回滚，但仍建议确认备份后再操作。')) {
+      return;
+    }
+
+    const backupInfo = Storage.getBackupById(selectedBackupId);
+    if (!backupInfo || !backupInfo.backupData) {
+      alert('备份数据不存在');
+      return;
+    }
+
+    if (selectedDataBlocks.length === 0) {
+      alert('请至少选择一个数据块');
+      return;
+    }
+
+    const allBlocks = ExportModule.getAllDataBlocks();
+    const isFull = selectedDataBlocks.length === allBlocks.length;
+
+    let result;
+    if (isFull) {
+      result = ExportModule.applyBackup(backupInfo.backupData, []);
+    } else {
+      result = ExportModule.applyPartialBackup(
+        backupInfo.backupData,
+        selectedDataBlocks,
+        []
+      );
+    }
+
+    if (result.success) {
+      alert('✅ ' + (result.summary || '恢复成功') + '\n\n恢复记录ID: ' + result.restoreRecordId);
+      closeBackupDetail();
+      location.reload();
+    } else {
+      if (result.businessConflicts) {
+        let msg = '⚠️ 检测到业务冲突，请先处理：\n\n';
+        result.businessConflicts.warnings.forEach(w => {
+          msg += '• ' + w + '\n';
+        });
+        msg += '\n是否仍要继续恢复？（不建议）';
+        if (confirm(msg)) {
+          alert('为保证数据安全，存在业务冲突时不允许恢复。请先关班或处理完所有待办事项。');
+        }
+      } else {
+        alert('❌ 恢复失败：' + result.message + (result.rolledBack ? '\n\n数据已自动回滚' : ''));
+      }
+    }
+  }
+
+  function showImportBackupModal() {
+    const modal = document.createElement('div');
+    modal.className = 'modal-overlay';
+    modal.id = 'import-backup-modal';
+    modal.innerHTML = `
+      <div class="modal">
+        <h3>导入备份文件</h3>
+        <div class="alert alert-warning" style="font-size:12px; margin-bottom:16px;">
+          选择从本系统导出的 .json 备份文件。导入后可在备份列表中查看和恢复。
+        </div>
+        <div class="form-group">
+          <label>选择备份文件</label>
+          <input type="file" id="import-file-input" accept=".json,application/json">
+        </div>
+        <div class="form-group">
+          <label>备份名称（可选）</label>
+          <input type="text" id="import-backup-name" placeholder="留空则使用默认名称">
+        </div>
+        <div class="form-group">
+          <label>备注（可选）</label>
+          <textarea id="import-backup-note" rows="2" placeholder="导入说明"></textarea>
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-default" onclick="document.getElementById('import-backup-modal').remove()">取消</button>
+          <button class="btn btn-primary" onclick="App.handleImportBackupFile()">导入</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+  }
+
+  function handleImportBackupFile() {
+    const fileInput = document.getElementById('import-file-input');
+    if (!fileInput.files || fileInput.files.length === 0) {
+      alert('请选择备份文件');
+      return;
+    }
+
+    const name = document.getElementById('import-backup-name').value.trim();
+    const note = document.getElementById('import-backup-note').value.trim();
+
+    const file = fileInput.files[0];
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      const content = e.target.result;
+      const parseResult = ExportModule.parseBackupFile(content);
+
+      if (!parseResult.success) {
+        alert('导入失败：' + parseResult.message);
+        return;
+      }
+
+      const backup = parseResult.backup;
+      const user = Auth.getCurrentUser();
+
+      const currentShift = backup.data.currentShift;
+      const history = backup.data.shiftHistory || [];
+      const allShifts = history.slice();
+      if (currentShift) allShifts.push(currentShift);
+
+      const invMap = backup.data.inventory || {};
+      const discMap = backup.data.discrepancies || {};
+
+      let totalDiscrepancies = 0;
+      let totalCorrections = 0;
+      let pendingCorrections = 0;
+      Object.values(discMap).forEach(list => {
+        totalDiscrepancies += list.length;
+        list.forEach(d => {
+          if (d.corrections) {
+            totalCorrections += d.corrections.length;
+            pendingCorrections += d.corrections.filter(c => c.status === 'pending').length;
+          }
+        });
+      });
+
+      const summary = {
+        shiftCount: allShifts.length,
+        hasActiveShift: allShifts.some(s => s.status && s.status !== 'closed'),
+        activeShiftName: currentShift ? currentShift.name : null,
+        drugCount: (backup.data.drugs || []).length,
+        inventoryShiftCount: Object.keys(invMap).length,
+        totalInventoryItems: Object.values(invMap).reduce((sum, arr) => sum + arr.length, 0),
+        totalDiscrepancies: totalDiscrepancies,
+        totalCorrections: totalCorrections,
+        pendingCorrections: pendingCorrections,
+        auditLogCount: (backup.data.auditLogs || []).length
+      };
+
+      const backupInfo = Storage.addBackupToHistory({
+        name: name || ('导入备份-' + Storage.formatDateTime(new Date())),
+        note: note || '从文件导入',
+        version: backup.version,
+        exportedAt: backup.exportedAt,
+        exportedAtFormatted: backup.exportedAtFormatted,
+        createdBy: user ? { id: user.id, name: user.name, role: user.role } : null,
+        importedFrom: backup.exportedBy || null,
+        summary: summary,
+        backupData: backup
+      });
+
+      Storage.addAuditLog(
+        '导入备份文件',
+        `导入备份「${backupInfo.name}」，包含${summary.shiftCount}个班次`,
+        user
+      );
+
+      alert('✅ 导入成功！备份已加入本地备份列表。');
+      document.getElementById('import-backup-modal').remove();
+      renderBackupCenter(document.getElementById('tab-content'));
+    };
+    reader.readAsText(file, 'UTF-8');
+  }
+
+  function renderRestoreRecordsView(container) {
+    const records = ExportModule.getRestoreRecords();
+
+    container.innerHTML = `
+      <div class="card">
+        <h3>恢复操作记录</h3>
+        <p style="font-size:12px; color:#8c8c8c; margin-bottom:12px;">
+          共 ${records.length} 条恢复记录（按时间倒序）
+        </p>
+        ${records.length === 0 ? `
+          <div class="empty-state">暂无恢复操作记录</div>
+        ` : `
+          <table style="width:100%; font-size:12px;">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>操作人</th>
+                <th>类型</th>
+                <th>数据块</th>
+                <th>结果</th>
+                <th>撤回</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${records.map(r => `
+                <tr>
+                  <td style="white-space:nowrap;">${r.timestampFormatted}</td>
+                  <td>${r.restoredBy ? r.restoredBy.name : '-'}</td>
+                  <td>${r.isPartial ? '部分恢复' : '完整恢复'}</td>
+                  <td style="font-size:11px;">
+                    ${r.dataBlocks ? r.dataBlocks.map(b => ExportModule.getDataBlockLabel(b)).join('、') : '-'}
+                  </td>
+                  <td>
+                    ${r.status === 'failed'
+                      ? `<span style="color:#ff4d4f;">失败</span><br><span style="font-size:10px; color:#8c8c8c;">${r.errorMessage || ''}</span>`
+                      : (r.undone ? '<span style="color:#8c8c8c;">已撤回</span>' : '<span style="color:#52c41a;">成功</span>')}
+                  </td>
+                  <td>
+                    ${r.undone && r.undoneAt
+                      ? `${r.undoneAtFormatted}<br><span style="font-size:10px;">${r.undoneBy ? r.undoneBy.name : ''}</span>`
+                      : '-'}
+                  </td>
+                </tr>
+                ${r.results ? `
+                  <tr>
+                    <td colspan="6" style="background:#fafafa; font-size:11px; padding:6px 12px; color:#595959;">
+                      结果：班次${r.results.importedShifts + r.results.overwrittenShifts + r.results.mergedShifts}个
+                      （新增${r.results.importedShifts}/覆盖${r.results.overwrittenShifts}/合并${r.results.mergedShifts}）
+                      | 药品${r.results.importedDrugs + r.results.overwrittenDrugs}种
+                      | 审计日志${r.results.importedAuditLogs}条
+                    </td>
+                  </tr>
+                ` : ''}
+              `).join('')}
+            </tbody>
+          </table>
+        `}
+      </div>
+    `;
+  }
+
+  function renderBackupSettings(container) {
+    const settings = Storage.getBackupSettings();
+    const historyCount = Storage.getBackupHistory().length;
+
+    container.innerHTML = `
+      <div class="card">
+        <h3>备份设置</h3>
+
+        <div class="form-group">
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+            <input type="checkbox" id="setting-autoclean"
+                   ${settings.autoCleanupEnabled ? 'checked' : ''}
+                   onchange="App.saveBackupSetting('autoCleanupEnabled', this.checked)">
+            启用自动清理过期备份
+          </label>
+        </div>
+
+        <div class="form-group">
+          <label>保留天数</label>
+          <input type="number" id="setting-retention"
+                 value="${settings.retentionDays}" min="1" max="365"
+                 onchange="App.saveBackupSetting('retentionDays', parseInt(this.value) || 30)"
+                 style="width:120px;">
+          <span style="font-size:12px; color:#8c8c8c; margin-left:8px;">天（超过此天数的备份将被自动清理）</span>
+        </div>
+
+        <div class="form-group">
+          <label>最大备份数量</label>
+          <input type="number" id="setting-maxbackups"
+                 value="${settings.maxBackups}" min="1" max="200"
+                 onchange="App.saveBackupSetting('maxBackups', parseInt(this.value) || 50)"
+                 style="width:120px;">
+          <span style="font-size:12px; color:#8c8c8c; margin-left:8px;">份（超出数量时最早的备份将被清理）</span>
+        </div>
+
+        <div style="margin-top:20px; padding:12px; background:#f6ffed; border-radius:4px;">
+          <p style="font-size:13px; margin:0 0 8px 0;">
+            <strong>当前状态：</strong>
+            本地存储 <strong>${historyCount}</strong> 份备份
+          </p>
+          <button class="btn btn-warning btn-sm" onclick="App.runCleanupNow()">立即执行清理</button>
+          <button class="btn btn-danger btn-sm" onclick="App.clearAllBackups()">清空所有备份</button>
+        </div>
+
+        <div class="alert alert-info" style="margin-top:16px; font-size:12px;">
+          <strong>💡 说明：</strong><br>
+          • 备份数据保存在浏览器本地存储 (localStorage) 中<br>
+          • 清理浏览器数据会导致备份丢失，重要数据请导出为文件保存<br>
+          • 所有恢复操作均有审计日志和回滚机制
+        </div>
+      </div>
+    `;
+  }
+
+  function saveBackupSetting(key, value) {
+    const settings = {};
+    settings[key] = value;
+    Storage.saveBackupSettings(settings);
+  }
+
+  function runCleanupNow() {
+    if (!confirm('确认立即执行备份清理？将根据保留规则删除过期和超出数量的备份。')) {
+      return;
+    }
+    const result = Storage.cleanupExpiredBackups();
+    alert(`清理完成：删除了 ${result.cleaned} 份备份，剩余 ${result.remaining} 份`);
+    renderBackupCenter(document.getElementById('tab-content'));
+  }
+
+  function clearAllBackups() {
+    if (!confirm('确认清空所有本地备份？此操作不可恢复！')) {
+      return;
+    }
+    if (!confirm('再次确认：所有本地备份将被永久删除，是否继续？')) {
+      return;
+    }
+    Storage.saveBackupHistory([]);
+    alert('已清空所有本地备份');
+    renderBackupCenter(document.getElementById('tab-content'));
+  }
+
   function formatDateSimple(date) {
     const d = new Date(date);
     const pad = n => n.toString().padStart(2, '0');
@@ -1277,7 +1966,23 @@ const App = (function() {
     handleApplyBackup,
     refreshPreview,
     showRestoreRecords,
-    handleUndoRestore
+    handleUndoRestore,
+    switchBackupSubTab,
+    filterBackups,
+    clearBackupFilters,
+    showCreateBackupModal,
+    handleCreateBackup,
+    viewBackupDetail,
+    closeBackupDetail,
+    toggleDataBlock,
+    selectAllDataBlocks,
+    previewBackupRestore,
+    applyBackupRestore,
+    showImportBackupModal,
+    handleImportBackupFile,
+    saveBackupSetting,
+    runCleanupNow,
+    clearAllBackups
   };
 })();
 

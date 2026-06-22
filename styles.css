@@ -558,3 +558,160 @@ table tr:hover {
     text-align: center;
   }
 }
+
+.backup-center {
+  width: 100%;
+}
+
+.backup-subtabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 16px;
+  background: white;
+  padding: 6px;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+}
+
+.backup-subtab {
+  flex: 1;
+  padding: 10px 14px;
+  text-align: center;
+  cursor: pointer;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #595959;
+  transition: all 0.3s;
+}
+
+.backup-subtab:hover {
+  background: #f5f5f5;
+  color: #1890ff;
+}
+
+.backup-subtab.active {
+  background: #e6f7ff;
+  color: #1890ff;
+}
+
+.backup-filter-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.backup-filter-input {
+  padding: 6px 10px;
+  border: 1px solid #d9d9d9;
+  border-radius: 4px;
+  font-size: 13px;
+  flex: 1;
+  min-width: 150px;
+}
+
+.backup-filter-select {
+  padding: 6px 10px;
+  border: 1px solid #d9d9d9;
+  border-radius: 4px;
+  font-size: 13px;
+  background: white;
+}
+
+.backup-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 500px;
+  overflow-y: auto;
+}
+
+.backup-item {
+  padding: 12px 16px;
+  background: #fafafa;
+  border: 1px solid #f0f0f0;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.3s;
+}
+
+.backup-item:hover {
+  background: #f0f7ff;
+  border-color: #91d5ff;
+}
+
+.backup-item.selected {
+  background: #e6f7ff;
+  border-color: #1890ff;
+}
+
+.backup-item-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.backup-item-name {
+  font-weight: 600;
+  color: #262626;
+  font-size: 14px;
+}
+
+.backup-item-date {
+  font-size: 12px;
+  color: #8c8c8c;
+}
+
+.backup-item-meta {
+  display: flex;
+  gap: 14px;
+  font-size: 12px;
+  color: #8c8c8c;
+  flex-wrap: wrap;
+}
+
+.backup-item-note {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #595959;
+  background: #fffbe6;
+  padding: 4px 8px;
+  border-radius: 4px;
+  display: inline-block;
+}
+
+.backup-detail-section {
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px dashed #f0f0f0;
+}
+
+.backup-detail-section:last-child {
+  border-bottom: none;
+  margin-bottom: 0;
+  padding-bottom: 0;
+}
+
+.btn-info {
+  background: #1890ff;
+  color: white;
+}
+
+.btn-info:hover {
+  background: #40a9ff;
+}
+
+@media (max-width: 768px) {
+  .backup-filter-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .backup-filter-input,
+  .backup-filter-select {
+    width: 100%;
+  }
+}
